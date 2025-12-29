@@ -9,19 +9,8 @@ import requests
 from collections import defaultdict
 from openpyxl import load_workbook
 from dateutil.parser import isoparse
+
 from services.keyvault import get_secret
-
-# ======================================================
-# CONFIGURATION (MOVE SECRETS TO KEY VAULT IN PROD)
-# ======================================================
-
-# CONCUR_BASE_URL = "https://<your-datacenter>.api.concursolutions.com"
-CONCUR_AUTH_URL = "https://us2.api.concursolutions.com"  # example only
-token_url = f"{CONCUR_AUTH_URL}/oauth2/v0/token"
-TEMPLATE_PATH = "reports/accrual report.xlsx"
-CONCUR_CLIENT_ID = "<FROM_KEY_VAULT>"
-CONCUR_CLIENT_SECRET = "<FROM_KEY_VAULT>"
-CONCUR_REFRESH_TOKEN = "<FROM_KEY_VAULT>"
 
 # ======================================================
 # FASTAPI APP
@@ -30,40 +19,87 @@ CONCUR_REFRESH_TOKEN = "<FROM_KEY_VAULT>"
 app = FastAPI(title="Concur Accruals API")
 
 # ======================================================
+# LOCAL FILES
+# ======================================================
+
+TEMPLATE_PATH = "reports/accrual report.xlsx"
+
+# ======================================================
+# KEY VAULT CONFIG CACHE (reduces KV calls per request)
+# ======================================================
+
+# Cache secrets for a short period to avoid calling Key Vault repeatedly.
+# This is safe for static secrets like client_id/client_secret/refresh_token/base urls.
+_SECRET_CACHE: Dict[str, Dict[str, object]] = {}
+_SECRET_TTL_SECONDS = 300  # 5 minutes
+
+def kv(name: str) -> str:
+    """Get a secret from Key Vault with short-lived in-memory caching."""
+    now = time.time()
+    cached = _SECRET_CACHE.get(name)
+    if cached and (now - float(cached["ts"])) < _SECRET_TTL_SECONDS:
+        return str(cached["value"])
+
+    value = get_secret(name)
+    _SECRET_CACHE[name] = {"value": value, "ts": now}
+    return value
+
+def concur_base_url() -> str:
+    # Example secret value: https://us2.api.concursolutions.com
+    return kv("concur-api-base-url").rstrip("/")
+
+def concur_token_url() -> str:
+    # Example secret value: https://us2.api.concursolutions.com/oauth2/v0/token
+    # If not set, we can derive it from the base URL.
+    try:
+        return kv("concur-token-url").rstrip("/")
+    except Exception:
+        return f"{concur_base_url()}/oauth2/v0/token"
+
+# ======================================================
 # CONCUR OAUTH (REFRESH TOKEN FLOW)
 # ======================================================
 
 class ConcurOAuthClient:
     def __init__(self):
-        self.access_token = None
-        self.expires_at = 0
+        self.access_token: Optional[str] = None
+        self.expires_at: float = 0.0
 
     def get_access_token(self) -> str:
         now = time.time()
         if self.access_token and now < self.expires_at - 60:
             return self.access_token
 
-        token_url = f"{CONCUR_BASE_URL}/oauth2/v0/token"
+        token_url = concur_token_url()
+
         resp = requests.post(
             token_url,
             data={
                 "grant_type": "refresh_token",
-                "refresh_token": CONCUR_REFRESH_TOKEN,
-                "client_id": CONCUR_CLIENT_ID,
-                "client_secret": CONCUR_CLIENT_SECRET
+                "refresh_token": kv("concur-refresh-token"),
+                "client_id": kv("concur-client-id"),
+                "client_secret": kv("concur-client-secret"),
             },
             timeout=20
         )
+
+        # Provide a clearer error for common auth failures
+        if resp.status_code in (400, 401, 403):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Concur OAuth failed (status {resp.status_code}). Check Key Vault secrets and Concur app config."
+            )
+
         resp.raise_for_status()
 
         data = resp.json()
         self.access_token = data["access_token"]
-        self.expires_at = now + data.get("expires_in", 1800)
+        self.expires_at = now + float(data.get("expires_in", 1800))
         return self.access_token
 
 oauth = ConcurOAuthClient()
 
-def concur_headers():
+def concur_headers() -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {oauth.get_access_token()}",
         "Accept": "application/json"
@@ -112,7 +148,7 @@ def build_identity_filter(req) -> Optional[str]:
 
 
 def get_users(filter_expression: Optional[str]) -> List[Dict]:
-    url = f"{CONCUR_BASE_URL}/profile/identity/v4.1/Users"
+    url = f"{concur_base_url()}/profile/identity/v4.1/Users"
     params = {
         "attributes": (
             "id,displayName,userName,emails.value,"
@@ -131,7 +167,7 @@ def get_users(filter_expression: Optional[str]) -> List[Dict]:
 # ======================================================
 
 def get_expense_reports(user_id: str) -> List[Dict]:
-    url = f"{CONCUR_BASE_URL}/expensereports/v4/users/{user_id}/reports"
+    url = f"{concur_base_url()}/expensereports/v4/users/{user_id}/reports"
     resp = requests.get(url, headers=concur_headers(), timeout=30)
     resp.raise_for_status()
     return resp.json().get("Items", [])
@@ -143,7 +179,7 @@ def filter_unsubmitted_reports(reports: List[Dict]) -> List[Dict]:
     for r in reports:
         payment_status_id = r.get("paymentStatusId")
 
-        # Exclude reports already paid or sent for payment
+        # Exclude reports already paid or processing
         if payment_status_id in ("P_PAID", "P_PROC"):
             continue
 
@@ -160,13 +196,12 @@ def filter_unsubmitted_reports(reports: List[Dict]) -> List[Dict]:
 
     return results
 
-
 # ======================================================
 # CARDS v4
 # ======================================================
 
 def get_card_transactions(user_id: str, date_from: str, date_to: str) -> List[Dict]:
-    url = f"{CONCUR_BASE_URL}/cards/v4/users/{user_id}/transactions"
+    url = f"{concur_base_url()}/cards/v4/users/{user_id}/transactions"
     params = {
         "transactionDateFrom": date_from,
         "transactionDateTo": date_to
@@ -182,11 +217,15 @@ def filter_unassigned_cards(transactions: List[Dict]) -> List[Dict]:
         if t.get("expenseId") or t.get("reportId"):
             continue
 
+        account = t.get("account") or {}
+        payment_type = account.get("paymentType") or {}
+
         results.append({
-            "cardProgramName": t["account"]["paymentType"]["id"],
-            "accountKey": t["account"]["lastSegment"],
-            "lastFourDigits": t["account"].get("lastFourDigits"),
-            "postedAmount": t["postedAmount"]["value"]
+            "cardProgramId": payment_type.get("id"),
+            "accountKey": account.get("lastSegment"),
+            "lastFourDigits": account.get("lastFourDigits"),
+            "postedAmount": (t.get("postedAmount") or {}).get("value"),
+            "currencyCode": (t.get("postedAmount") or {}).get("currencyCode"),
         })
     return results
 
@@ -198,6 +237,7 @@ def extract_date(txn: Dict, date_type: str) -> date:
     if date_type == "POSTED":
         return isoparse(txn["postedDate"]).date()
     if date_type == "BILLING":
+        # Not all transactions have statement/billingDate. Skip safely upstream if missing.
         return isoparse(txn["statement"]["billingDate"]).date()
     return isoparse(txn["transactionDate"]).date()
 
@@ -207,16 +247,30 @@ def compute_card_totals(transactions: List[Dict], from_date: date, to_date: date
     by_user = defaultdict(lambda: {"count": 0, "total": 0.0, "currency": ""})
 
     for t in transactions:
+        # Handle missing billing dates gracefully
+        if date_type == "BILLING":
+            stmt = t.get("statement") or {}
+            if not stmt.get("billingDate"):
+                continue
+        if date_type == "POSTED" and not t.get("postedDate"):
+            continue
+        if date_type == "TRANSACTION" and not t.get("transactionDate"):
+            continue
+
         d = extract_date(t, date_type)
         if not (from_date <= d <= to_date):
             continue
 
-        amount = t["postedAmount"]["value"]
-        currency = t["postedAmount"]["currencyCode"]
-        program = t["account"]["paymentType"]["id"]
+        posted_amount = t.get("postedAmount") or {}
+        amount = float(posted_amount.get("value") or 0.0)
+        currency = str(posted_amount.get("currencyCode") or "")
+
+        account = t.get("account") or {}
+        payment_type = account.get("paymentType") or {}
+        program = str(payment_type.get("id") or "")
 
         employee_id = t.get("employeeId")
-        user_key = employee_id if employee_id else f'{t["account"]["lastSegment"]} ({program})'
+        user_key = employee_id if employee_id else f'{account.get("lastSegment")} ({program})'
 
         by_program[program]["count"] += 1
         by_program[program]["total"] += amount
@@ -278,6 +332,7 @@ def accruals_search(req: AccrualsSearchRequest):
         reports = get_expense_reports(u["id"])
         unsubmitted_reports.extend(filter_unsubmitted_reports(reports))
 
+        # NOTE: you had a wide range here for unassigned card accrual visibility.
         txns = get_card_transactions(u["id"], "2000-01-01", date.today().isoformat())
         unassigned_cards.extend(filter_unassigned_cards(txns))
 
@@ -293,6 +348,10 @@ def accruals_search(req: AccrualsSearchRequest):
 
 @app.post("/api/cardtotals/export")
 def card_totals_export(req: CardTotalsRequest):
+    date_type = (req.dateType or "").upper()
+    if date_type not in ("TRANSACTION", "POSTED", "BILLING"):
+        raise HTTPException(status_code=400, detail="dateType must be TRANSACTION, POSTED, or BILLING")
+
     filter_expr = build_identity_filter(req)
     users = get_users(filter_expr)
 
@@ -306,7 +365,7 @@ def card_totals_export(req: CardTotalsRequest):
         all_txns,
         date.fromisoformat(req.transactionDateFrom),
         date.fromisoformat(req.transactionDateTo),
-        req.dateType
+        date_type
     )
 
     xlsx = export_card_totals_excel(
@@ -314,7 +373,7 @@ def card_totals_export(req: CardTotalsRequest):
         {
             "from": req.transactionDateFrom,
             "to": req.transactionDateTo,
-            "type": req.dateType
+            "type": date_type
         }
     )
 
@@ -328,7 +387,13 @@ def card_totals_export(req: CardTotalsRequest):
 
 @app.get("/kv-test")
 def kv_test():
-    return {
-        "status": "ok",
-        "client_id_exists": bool(get_secret("concur-client-id"))
-    }
+    """
+    Simple Key Vault read test.
+    Returns true if the secret exists and the app can read it via Managed Identity.
+    """
+    try:
+        client_id = kv("concur-client-id")
+        return {"status": "ok", "client_id_exists": bool(client_id)}
+    except Exception as e:
+        # Return the error message in a controlled way for debugging
+        raise HTTPException(status_code=500, detail=f"Key Vault read failed: {str(e)}")
