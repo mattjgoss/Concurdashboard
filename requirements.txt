@@ -1,0 +1,7 @@
+fastapi
+gunicorn
+uvicorn
+requests
+pydantic
+openpyxl
+python-dateutil
