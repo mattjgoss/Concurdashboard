@@ -9,9 +9,9 @@ import requests
 from collections import defaultdict
 from openpyxl import load_workbook
 from dateutil.parser import isoparse
-
 from services.keyvault import get_secret
-
+import os
+BUILD_FINGERPRINT = os.getenv("SCM_COMMIT_ID") or os.getenv("WEBSITE_DEPLOYMENT_ID") or "unknown"
 # ======================================================
 # FASTAPI APP
 # ======================================================
@@ -397,3 +397,16 @@ def kv_test():
     except Exception as e:
         # Return the error message in a controlled way for debugging
         raise HTTPException(status_code=500, detail=f"Key Vault read failed: {str(e)}")
+
+@app.get("/build")
+def build():
+    return {
+        "fingerprint": BUILD_FINGERPRINT,
+        "file": __file__,
+        "cwd": os.getcwd(),
+        "run_from_package": os.getenv("WEBSITE_RUN_FROM_PACKAGE"),
+        "scm_build": os.getenv("SCM_DO_BUILD_DURING_DEPLOYMENT"),
+        "scm_commit": os.getenv("SCM_COMMIT_ID"),
+        "deployment_id": os.getenv("WEBSITE_DEPLOYMENT_ID"),
+    }
+
