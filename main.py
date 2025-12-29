@@ -1,4 +1,4 @@
-print("####### LOADED MAIN FROM:", __file__)
+print("### LOADED MAIN FROM:", __file__)
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
