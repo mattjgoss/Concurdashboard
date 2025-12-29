@@ -5,3 +5,5 @@ requests
 pydantic
 openpyxl
 python-dateutil
+azure-identity
+azure-keyvault-secrets
