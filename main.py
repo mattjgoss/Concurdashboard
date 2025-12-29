@@ -1,3 +1,5 @@
+print("### LOADED MAIN FROM:", __file__)
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
