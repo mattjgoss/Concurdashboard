@@ -9,6 +9,7 @@ import requests
 from collections import defaultdict
 from openpyxl import load_workbook
 from dateutil.parser import isoparse
+from services.keyvault import get_secret
 
 # ======================================================
 # CONFIGURATION (MOVE SECRETS TO KEY VAULT IN PROD)
@@ -324,3 +325,10 @@ def card_totals_export(req: CardTotalsRequest):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'}
     )
+
+@app.get("/kv-test")
+def kv_test():
+    return {
+        "status": "ok",
+        "client_id_exists": bool(get_secret("concur-client-id"))
+    }
