@@ -440,3 +440,13 @@ def concur_auth_test():
         "token_type": tok.get("token_type"),
         "scope": tok.get("scope"),
     }
+
+@app.get("/debug/routes")
+def debug_routes():
+    return sorted([getattr(r, "path", "") for r in app.router.routes])
+
+from datetime import datetime
+
+@app.get("/debug/deploy")
+def debug_deploy():
+    return {"deploy": "auth-test-v1", "utc": datetime.utcnow().isoformat() + "Z"}
