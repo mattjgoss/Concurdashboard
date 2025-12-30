@@ -400,36 +400,59 @@ def build():
 
 @app.get("/api/concur/auth-test")
 def concur_auth_test():
-    # 1) Load secrets from Key Vault via your kv() helper
-    base_url = kv("concur-api-base-url")  # e.g. https://us.api.concursolutions.com
-    try:
-    token_url = kv("concur-token-url")
-except Exception:
-    token_url = f"{base_url}/oauth2/v0/token"
+    # 1) Load config/secrets (Key Vault first, env fallback where useful)
+    base_url = kv("concur-api-base-url", os.getenv("CONCUR_API_BASE_URL"))
+    if not base_url:
+        raise HTTPException(status_code=500, detail={
+            "status": "error",
+            "error": "missing_config",
+            "missing": ["concur-api-base-url / CONCUR_API_BASE_URL"],
+        })
 
-    client_id = kv("concur-client-id")
-    client_secret = kv("concur-client-secret")
-    refresh_token = kv("concur-refresh-token")
+    token_url = kv("concur-token-url", os.getenv("CONCUR_TOKEN_URL")) or f"{base_url.rstrip('/')}/oauth2/v0/token"
+
+    client_id = kv("concur-client-id", os.getenv("CONCUR_CLIENT_ID"))
+    client_secret = kv("concur-client-secret", os.getenv("CONCUR_CLIENT_SECRET"))
+    refresh_token = kv("concur-refresh-token", os.getenv("CONCUR_REFRESH_TOKEN"))
+
+    missing = [k for k, v in {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token,
+    }.items() if not v]
+    if missing:
+        raise HTTPException(status_code=500, detail={
+            "status": "error",
+            "error": "missing_config",
+            "missing": missing,
+        })
 
     # 2) Refresh token -> access token
     data = {
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
     }
+
     r = requests.post(token_url, data=data, auth=(client_id, client_secret), timeout=30)
     if r.status_code != 200:
         raise HTTPException(status_code=502, detail={
             "stage": "token",
             "status_code": r.status_code,
             "body": safe_body(r),
+            "token_endpoint": token_url,
         })
+
     tok = r.json()
     access_token = tok.get("access_token")
     if not access_token:
-        raise HTTPException(status_code=502, detail={"stage": "token", "error": "No access_token in response"})
+        raise HTTPException(status_code=502, detail={
+            "stage": "token",
+            "error": "No access_token in response",
+            "token_response_keys": list(tok.keys()),
+        })
 
-    # 3) Call a lightweight Concur API endpoint
-    url = f"{base_url}/profile/identity/v4.1/Users?startIndex=1&count=1"
+    # 3) Call a lightweight Concur API endpoint (Identity)
+    url = f"{base_url.rstrip('/')}/profile/identity/v4.1/Users?startIndex=1&count=1"
     h = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
     u = requests.get(url, headers=h, timeout=30)
 
@@ -439,11 +462,12 @@ except Exception:
         "identity_test_url": url,
         "identity_status_code": u.status_code,
         "identity_snippet": u.text[:300],
-        # Optional token metadata (safe):
+        # Token metadata (safe):
         "expires_in": tok.get("expires_in"),
         "token_type": tok.get("token_type"),
         "scope": tok.get("scope"),
     }
+
 
 @app.get("/debug/routes")
 def debug_routes():
