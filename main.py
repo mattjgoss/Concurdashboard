@@ -5,7 +5,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, date
 from io import BytesIO
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 
 import requests
 from dateutil.parser import isoparse
@@ -14,6 +14,7 @@ from fastapi.responses import StreamingResponse
 from openpyxl import load_workbook
 from pydantic import BaseModel
 
+# IMPORTANT: requires services/__init__.py and services/identity_service.py in the zip
 from services.identity_service import get_secret, keyvault_status
 
 BUILD_FINGERPRINT = os.getenv("SCM_COMMIT_ID") or os.getenv("WEBSITE_DEPLOYMENT_ID") or "unknown"
@@ -33,27 +34,54 @@ app = FastAPI(title="Concur Accruals API")
 TEMPLATE_PATH = "reports/accrual report.xlsx"
 
 # ======================================================
+# HELPERS
+# ======================================================
+
+def safe_body(resp: requests.Response, limit: int = 1000) -> str:
+    """Return a safe, truncated response body for diagnostics."""
+    try:
+        txt = resp.text or ""
+        return txt[:limit]
+    except Exception:
+        return "<unreadable>"
+
+# ======================================================
 # KEY VAULT ACCESS (thin wrapper)
 # ======================================================
 
-def kv(name: str) -> str:
+def kv(name: str, fallback: Optional[str] = None) -> Optional[str]:
     """
     Fetch a secret from Key Vault (via services.identity_service.get_secret).
-    Caching + client init are handled inside identity_service.py.
+    If Key Vault read fails or secret is missing/blank, return fallback.
     """
-    return get_secret(name)
+    try:
+        val = get_secret(name)
+        if val is None:
+            return fallback
+        if isinstance(val, str) and val.strip() == "":
+            return fallback
+        return val
+    except Exception:
+        return fallback
 
 def concur_base_url() -> str:
     # Example secret value: https://us2.api.concursolutions.com
-    return kv("concur-api-base-url").rstrip("/")
+    base = kv("concur-api-base-url", os.getenv("CONCUR_API_BASE_URL"))
+    if not base:
+        raise HTTPException(status_code=500, detail={
+            "status": "error",
+            "error": "missing_config",
+            "missing": ["concur-api-base-url / CONCUR_API_BASE_URL"],
+        })
+    return str(base).rstrip("/")
 
 def concur_token_url() -> str:
     # Example secret value: https://us2.api.concursolutions.com/oauth2/v0/token
     # If not set, derive from base URL.
-    try:
-        return kv("concur-token-url").rstrip("/")
-    except Exception:
-        return f"{concur_base_url()}/oauth2/v0/token"
+    token = kv("concur-token-url", os.getenv("CONCUR_TOKEN_URL"))
+    if token:
+        return str(token).rstrip("/")
+    return f"{concur_base_url()}/oauth2/v0/token"
 
 # ======================================================
 # CONCUR OAUTH (REFRESH TOKEN FLOW)
@@ -71,13 +99,32 @@ class ConcurOAuthClient:
 
         token_url = concur_token_url()
 
+        client_id = kv("concur-client-id", os.getenv("CONCUR_CLIENT_ID"))
+        client_secret = kv("concur-client-secret", os.getenv("CONCUR_CLIENT_SECRET"))
+        refresh_token = kv("concur-refresh-token", os.getenv("CONCUR_REFRESH_TOKEN"))
+
+        missing = [k for k, v in {
+            "concur-client-id / CONCUR_CLIENT_ID": client_id,
+            "concur-client-secret / CONCUR_CLIENT_SECRET": client_secret,
+            "concur-refresh-token / CONCUR_REFRESH_TOKEN": refresh_token,
+        }.items() if not v]
+        if missing:
+            raise HTTPException(status_code=500, detail={
+                "status": "error",
+                "error": "missing_config",
+                "missing": missing,
+            })
+
+        # Concur refresh-token flow: client_id/client_secret can be sent either in
+        # Authorization header (basic auth) or in form body depending on app config.
+        # Your earlier pattern used form fields; we keep it (works for many Concur apps).
         resp = requests.post(
             token_url,
             data={
                 "grant_type": "refresh_token",
-                "refresh_token": kv("concur-refresh-token"),
-                "client_id": kv("concur-client-id"),
-                "client_secret": kv("concur-client-secret"),
+                "refresh_token": refresh_token,
+                "client_id": client_id,
+                "client_secret": client_secret,
             },
             timeout=20,
         )
@@ -85,14 +132,30 @@ class ConcurOAuthClient:
         if resp.status_code in (400, 401, 403):
             raise HTTPException(
                 status_code=502,
-                detail=(
-                    f"Concur OAuth failed (status {resp.status_code}). "
-                    "Check Key Vault secrets and Concur app config."
-                ),
+                detail={
+                    "stage": "token",
+                    "error": "concur_oauth_failed",
+                    "status_code": resp.status_code,
+                    "token_endpoint": token_url,
+                    "body": safe_body(resp),
+                    "hint": "Check Key Vault secrets + Concur app refresh token + client credentials.",
+                },
             )
 
         resp.raise_for_status()
         data = resp.json()
+
+        if "access_token" not in data:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "stage": "token",
+                    "error": "no_access_token_in_response",
+                    "token_endpoint": token_url,
+                    "token_response_keys": list(data.keys()),
+                    "body": safe_body(resp),
+                },
+            )
 
         self.access_token = data["access_token"]
         self.expires_at = now + float(data.get("expires_in", 1800))
@@ -125,7 +188,7 @@ class CardTotalsRequest(AccrualsSearchRequest):
 # IDENTITY v4.1 (USER RESOLUTION)
 # ======================================================
 
-def build_identity_filter(req) -> Optional[str]:
+def build_identity_filter(req: Any) -> Optional[str]:
     filters = []
 
     for i in range(1, 7):
@@ -135,7 +198,7 @@ def build_identity_filter(req) -> Optional[str]:
                 f'urn:ietf:params:scim:schemas:extension:spend:2.0:User:orgUnit{i} eq "{val}"'
             )
 
-    if req.custom21:
+    if getattr(req, "custom21", None):
         filters.append(
             'urn:ietf:params:scim:schemas:extension:spend:2.0:User:customData'
             f'[id eq "custom21" and value eq "{req.custom21}"]'
@@ -156,7 +219,7 @@ def get_users(filter_expression: Optional[str]) -> List[Dict]:
 
     resp = requests.get(url, headers=concur_headers(), params=params, timeout=30)
     resp.raise_for_status()
-    return resp.json().get("Resources", [])
+    return resp.json().get("Resources", []) or []
 
 # ======================================================
 # EXPENSE REPORTS v4
@@ -166,7 +229,7 @@ def get_expense_reports(user_id: str) -> List[Dict]:
     url = f"{concur_base_url()}/expensereports/v4/users/{user_id}/reports"
     resp = requests.get(url, headers=concur_headers(), timeout=30)
     resp.raise_for_status()
-    return resp.json().get("Items", [])
+    return resp.json().get("Items", []) or []
 
 def filter_unsubmitted_reports(reports: List[Dict]) -> List[Dict]:
     results = []
@@ -200,7 +263,7 @@ def get_card_transactions(user_id: str, date_from: str, date_to: str) -> List[Di
     params = {"transactionDateFrom": date_from, "transactionDateTo": date_to}
     resp = requests.get(url, headers=concur_headers(), params=params, timeout=30)
     resp.raise_for_status()
-    return resp.json().get("Items", [])
+    return resp.json().get("Items", []) or []
 
 def filter_unassigned_cards(transactions: List[Dict]) -> List[Dict]:
     results = []
@@ -294,13 +357,13 @@ def export_card_totals_excel(totals: Dict, meta: Dict) -> bytes:
     ws.append(["Card program", "Count", "Total", "Currency"])
 
     for p in totals["totalsByProgram"]:
-        ws.append([p["cardProgramId"], p["count"], p["total"], p["currency"]])
+        ws.append([p.get("cardProgramId"), p.get("count"), p.get("total"), p.get("currency")])
 
     ws.append([])
     ws.append(["User key", "Count", "Total", "Currency"])
 
     for u in totals["totalsByUser"]:
-        ws.append([u["userKey"], u["count"], u["total"], u["currency"]])
+        ws.append([u.get("userKey"), u.get("count"), u.get("total"), u.get("currency")])
 
     out = BytesIO()
     wb.save(out)
@@ -380,7 +443,6 @@ def kv_test():
         client_id = kv("concur-client-id")
         return {"status": "ok", "client_id_exists": bool(client_id), "keyvault": keyvault_status()}
     except Exception as e:
-        # Controlled error response for Phase 1
         raise HTTPException(
             status_code=500,
             detail={"message": f"Key Vault read failed: {str(e)}", "keyvault": keyvault_status()},
@@ -400,7 +462,7 @@ def build():
 
 @app.get("/api/concur/auth-test")
 def concur_auth_test():
-    # 1) Load config/secrets (Key Vault first, env fallback where useful)
+    # 1) Load config/secrets (Key Vault first, env fallback)
     base_url = kv("concur-api-base-url", os.getenv("CONCUR_API_BASE_URL"))
     if not base_url:
         raise HTTPException(status_code=500, detail={
@@ -409,7 +471,7 @@ def concur_auth_test():
             "missing": ["concur-api-base-url / CONCUR_API_BASE_URL"],
         })
 
-    token_url = kv("concur-token-url", os.getenv("CONCUR_TOKEN_URL")) or f"{base_url.rstrip('/')}/oauth2/v0/token"
+    token_url = kv("concur-token-url", os.getenv("CONCUR_TOKEN_URL")) or f"{str(base_url).rstrip('/')}/oauth2/v0/token"
 
     client_id = kv("concur-client-id", os.getenv("CONCUR_CLIENT_ID"))
     client_secret = kv("concur-client-secret", os.getenv("CONCUR_CLIENT_SECRET"))
@@ -428,10 +490,7 @@ def concur_auth_test():
         })
 
     # 2) Refresh token -> access token
-    data = {
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-    }
+    data = {"grant_type": "refresh_token", "refresh_token": refresh_token}
 
     r = requests.post(token_url, data=data, auth=(client_id, client_secret), timeout=30)
     if r.status_code != 200:
@@ -452,7 +511,7 @@ def concur_auth_test():
         })
 
     # 3) Call a lightweight Concur API endpoint (Identity)
-    url = f"{base_url.rstrip('/')}/profile/identity/v4.1/Users?startIndex=1&count=1"
+    url = f"{str(base_url).rstrip('/')}/profile/identity/v4.1/Users?startIndex=1&count=1"
     h = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
     u = requests.get(url, headers=h, timeout=30)
 
@@ -461,19 +520,15 @@ def concur_auth_test():
         "token_endpoint": token_url,
         "identity_test_url": url,
         "identity_status_code": u.status_code,
-        "identity_snippet": u.text[:300],
-        # Token metadata (safe):
+        "identity_snippet": (u.text or "")[:300],
         "expires_in": tok.get("expires_in"),
         "token_type": tok.get("token_type"),
         "scope": tok.get("scope"),
     }
 
-
 @app.get("/debug/routes")
 def debug_routes():
     return sorted([getattr(r, "path", "") for r in app.router.routes])
-
-from datetime import datetime
 
 @app.get("/debug/deploy")
 def debug_deploy():
