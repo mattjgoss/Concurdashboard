@@ -1,14 +1,42 @@
-name: Manual deploy to Azure Web App - rg-concur-accruals-poc
+name: Manual deploy (Linux wheelhouse) - rg-concur-accruals-poc
 
 on:
   workflow_dispatch:
 
 jobs:
-  deploy:
+  build_and_deploy:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build Linux wheelhouse
+        run: |
+          python -m pip install --upgrade pip
+          rm -rf wheelhouse
+          pip download -r requirements.txt -d wheelhouse
+
+      - name: Sanity check wheels (must NOT be win_amd64)
+        run: |
+          if ls wheelhouse | grep -i "win_amd64" ; then
+            echo "ERROR: Found Windows wheels in wheelhouse. This will fail on Linux App Service."
+            exit 1
+          fi
+          echo "Wheelhouse looks Linux-safe."
+
+      - name: Create deploy zip (code at zip root)
+        run: |
+          rm -f Phase1.zip
+          zip -r Phase1.zip main.py requirements.txt wheelhouse reports auth services
+          unzip -l Phase1.zip | head -n 40
 
       - name: Login to Azure
         uses: azure/login@v2
@@ -17,8 +45,9 @@ jobs:
           tenant-id: ${{ secrets.__tenantidsecretname__ }}
           subscription-id: ${{ secrets.__subscriptionidsecretname__ }}
 
-      - name: Deploy to Azure Web App
+      - name: Deploy zip to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
           app-name: rg-concur-accruals-poc
           slot-name: Production
+          package: Phase1.zip
