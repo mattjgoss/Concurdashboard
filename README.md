@@ -1,4 +1,4 @@
-# Concur Accruals API
+# Concur Accruals API.
 
 A comprehensive FastAPI-based REST API service for managing SAP Concur expense accruals, card transaction reporting, and user expense management. This application integrates with SAP Concur's Identity, Expense Reports, and Cards APIs to provide consolidated reporting and analytics capabilities.
 
