@@ -1,5 +1,5 @@
 import requests
-from app.auth.concur_oauth import ConcurOAuthClient
+from auth.concur_oauth import ConcurOAuthClient
 
 class CardsService:
     def __init__(self, oauth: ConcurOAuthClient):

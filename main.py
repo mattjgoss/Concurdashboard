@@ -1,19 +1,25 @@
 print("### LOADED MAIN FROM:", __file__)
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from typing import Optional, List, Dict
+import os
+import time
+from collections import defaultdict
 from datetime import datetime, date
 from io import BytesIO
-import time
+from typing import Optional, List, Dict
+
 import requests
-from collections import defaultdict
-from openpyxl import load_workbook
 from dateutil.parser import isoparse
-from services.keyvault import get_secret
-import os
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from openpyxl import load_workbook
+from pydantic import BaseModel
+
+from services.identity_service import get_secret, keyvault_status
+
 BUILD_FINGERPRINT = os.getenv("SCM_COMMIT_ID") or os.getenv("WEBSITE_DEPLOYMENT_ID") or "unknown"
+print("RUN_FROM_PACKAGE =", os.getenv("WEBSITE_RUN_FROM_PACKAGE"))
+print("PWD =", os.getcwd())
+
 # ======================================================
 # FASTAPI APP
 # ======================================================
@@ -27,24 +33,15 @@ app = FastAPI(title="Concur Accruals API")
 TEMPLATE_PATH = "reports/accrual report.xlsx"
 
 # ======================================================
-# KEY VAULT CONFIG CACHE (reduces KV calls per request)
+# KEY VAULT ACCESS (thin wrapper)
 # ======================================================
 
-# Cache secrets for a short period to avoid calling Key Vault repeatedly.
-# This is safe for static secrets like client_id/client_secret/refresh_token/base urls.
-_SECRET_CACHE: Dict[str, Dict[str, object]] = {}
-_SECRET_TTL_SECONDS = 300  # 5 minutes
-
 def kv(name: str) -> str:
-    """Get a secret from Key Vault with short-lived in-memory caching."""
-    now = time.time()
-    cached = _SECRET_CACHE.get(name)
-    if cached and (now - float(cached["ts"])) < _SECRET_TTL_SECONDS:
-        return str(cached["value"])
-
-    value = get_secret(name)
-    _SECRET_CACHE[name] = {"value": value, "ts": now}
-    return value
+    """
+    Fetch a secret from Key Vault (via services.identity_service.get_secret).
+    Caching + client init are handled inside identity_service.py.
+    """
+    return get_secret(name)
 
 def concur_base_url() -> str:
     # Example secret value: https://us2.api.concursolutions.com
@@ -52,7 +49,7 @@ def concur_base_url() -> str:
 
 def concur_token_url() -> str:
     # Example secret value: https://us2.api.concursolutions.com/oauth2/v0/token
-    # If not set, we can derive it from the base URL.
+    # If not set, derive from base URL.
     try:
         return kv("concur-token-url").rstrip("/")
     except Exception:
@@ -82,19 +79,21 @@ class ConcurOAuthClient:
                 "client_id": kv("concur-client-id"),
                 "client_secret": kv("concur-client-secret"),
             },
-            timeout=20
+            timeout=20,
         )
 
-        # Provide a clearer error for common auth failures
         if resp.status_code in (400, 401, 403):
             raise HTTPException(
                 status_code=502,
-                detail=f"Concur OAuth failed (status {resp.status_code}). Check Key Vault secrets and Concur app config."
+                detail=(
+                    f"Concur OAuth failed (status {resp.status_code}). "
+                    "Check Key Vault secrets and Concur app config."
+                ),
             )
 
         resp.raise_for_status()
-
         data = resp.json()
+
         self.access_token = data["access_token"]
         self.expires_at = now + float(data.get("expires_in", 1800))
         return self.access_token
@@ -102,10 +101,7 @@ class ConcurOAuthClient:
 oauth = ConcurOAuthClient()
 
 def concur_headers() -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {oauth.get_access_token()}",
-        "Accept": "application/json"
-    }
+    return {"Authorization": f"Bearer {oauth.get_access_token()}", "Accept": "application/json"}
 
 # ======================================================
 # REQUEST MODELS
@@ -119,7 +115,6 @@ class AccrualsSearchRequest(BaseModel):
     orgUnit5: Optional[str] = None
     orgUnit6: Optional[str] = None
     custom21: Optional[str] = None
-
 
 class CardTotalsRequest(AccrualsSearchRequest):
     transactionDateFrom: str
@@ -148,7 +143,6 @@ def build_identity_filter(req) -> Optional[str]:
 
     return " and ".join(filters) if filters else None
 
-
 def get_users(filter_expression: Optional[str]) -> List[Dict]:
     url = f"{concur_base_url()}/profile/identity/v4.1/Users"
     params = {
@@ -174,10 +168,8 @@ def get_expense_reports(user_id: str) -> List[Dict]:
     resp.raise_for_status()
     return resp.json().get("Items", [])
 
-
 def filter_unsubmitted_reports(reports: List[Dict]) -> List[Dict]:
     results = []
-
     for r in reports:
         payment_status_id = r.get("paymentStatusId")
 
@@ -185,17 +177,18 @@ def filter_unsubmitted_reports(reports: List[Dict]) -> List[Dict]:
         if payment_status_id in ("P_PAID", "P_PROC"):
             continue
 
-        results.append({
-            "lastName": r.get("owner", {}).get("lastName"),
-            "firstName": r.get("owner", {}).get("firstName"),
-            "reportName": r.get("name"),
-            "submitted": r.get("approvalStatus") == "Submitted",
-            "reportCreationDate": r.get("creationDate"),
-            "reportSubmissionDate": r.get("submitDate"),
-            "paymentStatusId": payment_status_id,
-            "totalAmount": r.get("totalAmount", {}).get("value")
-        })
-
+        results.append(
+            {
+                "lastName": r.get("owner", {}).get("lastName"),
+                "firstName": r.get("owner", {}).get("firstName"),
+                "reportName": r.get("name"),
+                "submitted": r.get("approvalStatus") == "Submitted",
+                "reportCreationDate": r.get("creationDate"),
+                "reportSubmissionDate": r.get("submitDate"),
+                "paymentStatusId": payment_status_id,
+                "totalAmount": (r.get("totalAmount") or {}).get("value"),
+            }
+        )
     return results
 
 # ======================================================
@@ -204,14 +197,10 @@ def filter_unsubmitted_reports(reports: List[Dict]) -> List[Dict]:
 
 def get_card_transactions(user_id: str, date_from: str, date_to: str) -> List[Dict]:
     url = f"{concur_base_url()}/cards/v4/users/{user_id}/transactions"
-    params = {
-        "transactionDateFrom": date_from,
-        "transactionDateTo": date_to
-    }
+    params = {"transactionDateFrom": date_from, "transactionDateTo": date_to}
     resp = requests.get(url, headers=concur_headers(), params=params, timeout=30)
     resp.raise_for_status()
     return resp.json().get("Items", [])
-
 
 def filter_unassigned_cards(transactions: List[Dict]) -> List[Dict]:
     results = []
@@ -222,13 +211,16 @@ def filter_unassigned_cards(transactions: List[Dict]) -> List[Dict]:
         account = t.get("account") or {}
         payment_type = account.get("paymentType") or {}
 
-        results.append({
-            "cardProgramId": payment_type.get("id"),
-            "accountKey": account.get("lastSegment"),
-            "lastFourDigits": account.get("lastFourDigits"),
-            "postedAmount": (t.get("postedAmount") or {}).get("value"),
-            "currencyCode": (t.get("postedAmount") or {}).get("currencyCode"),
-        })
+        posted = t.get("postedAmount") or {}
+        results.append(
+            {
+                "cardProgramId": payment_type.get("id"),
+                "accountKey": account.get("lastSegment"),
+                "lastFourDigits": account.get("lastFourDigits"),
+                "postedAmount": posted.get("value"),
+                "currencyCode": posted.get("currencyCode"),
+            }
+        )
     return results
 
 # ======================================================
@@ -239,17 +231,14 @@ def extract_date(txn: Dict, date_type: str) -> date:
     if date_type == "POSTED":
         return isoparse(txn["postedDate"]).date()
     if date_type == "BILLING":
-        # Not all transactions have statement/billingDate. Skip safely upstream if missing.
         return isoparse(txn["statement"]["billingDate"]).date()
     return isoparse(txn["transactionDate"]).date()
-
 
 def compute_card_totals(transactions: List[Dict], from_date: date, to_date: date, date_type: str):
     by_program = defaultdict(lambda: {"count": 0, "total": 0.0, "currency": ""})
     by_user = defaultdict(lambda: {"count": 0, "total": 0.0, "currency": ""})
 
     for t in transactions:
-        # Handle missing billing dates gracefully
         if date_type == "BILLING":
             stmt = t.get("statement") or {}
             if not stmt.get("billingDate"):
@@ -284,7 +273,7 @@ def compute_card_totals(transactions: List[Dict], from_date: date, to_date: date
 
     return {
         "totalsByProgram": [{"cardProgramId": k, **v} for k, v in by_program.items()],
-        "totalsByUser": [{"userKey": k, **v} for k, v in by_user.items()]
+        "totalsByUser": [{"userKey": k, **v} for k, v in by_user.items()],
     }
 
 # ======================================================
@@ -334,19 +323,17 @@ def accruals_search(req: AccrualsSearchRequest):
         reports = get_expense_reports(u["id"])
         unsubmitted_reports.extend(filter_unsubmitted_reports(reports))
 
-        # NOTE: you had a wide range here for unassigned card accrual visibility.
         txns = get_card_transactions(u["id"], "2000-01-01", date.today().isoformat())
         unassigned_cards.extend(filter_unassigned_cards(txns))
 
     return {
         "summary": {
             "unsubmittedReportCount": len(unsubmitted_reports),
-            "unassignedCardCount": len(unassigned_cards)
+            "unassignedCardCount": len(unassigned_cards),
         },
         "unsubmittedReports": unsubmitted_reports,
-        "unassignedCards": unassigned_cards
+        "unassignedCards": unassigned_cards,
     }
-
 
 @app.post("/api/cardtotals/export")
 def card_totals_export(req: CardTotalsRequest):
@@ -359,24 +346,18 @@ def card_totals_export(req: CardTotalsRequest):
 
     all_txns = []
     for u in users:
-        all_txns.extend(
-            get_card_transactions(u["id"], req.transactionDateFrom, req.transactionDateTo)
-        )
+        all_txns.extend(get_card_transactions(u["id"], req.transactionDateFrom, req.transactionDateTo))
 
     totals = compute_card_totals(
         all_txns,
         date.fromisoformat(req.transactionDateFrom),
         date.fromisoformat(req.transactionDateTo),
-        date_type
+        date_type,
     )
 
     xlsx = export_card_totals_excel(
         totals,
-        {
-            "from": req.transactionDateFrom,
-            "to": req.transactionDateTo,
-            "type": date_type
-        }
+        {"from": req.transactionDateFrom, "to": req.transactionDateTo, "type": date_type},
     )
 
     filename = f"Concur_Card_Totals_{datetime.now():%Y%m%d_%H%M}.xlsx"
@@ -384,21 +365,26 @@ def card_totals_export(req: CardTotalsRequest):
     return StreamingResponse(
         BytesIO(xlsx),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 @app.get("/kv-test")
 def kv_test():
     """
     Simple Key Vault read test.
-    Returns true if the secret exists and the app can read it via Managed Identity.
+    Returns:
+      - status: ok (if read works)
+      - status: error (if KV config/MI/permissions fail)
     """
     try:
         client_id = kv("concur-client-id")
-        return {"status": "ok", "client_id_exists": bool(client_id)}
+        return {"status": "ok", "client_id_exists": bool(client_id), "keyvault": keyvault_status()}
     except Exception as e:
-        # Return the error message in a controlled way for debugging
-        raise HTTPException(status_code=500, detail=f"Key Vault read failed: {str(e)}")
+        # Controlled error response for Phase 1
+        raise HTTPException(
+            status_code=500,
+            detail={"message": f"Key Vault read failed: {str(e)}", "keyvault": keyvault_status()},
+        )
 
 @app.get("/build")
 def build():
@@ -411,4 +397,3 @@ def build():
         "scm_commit": os.getenv("SCM_COMMIT_ID"),
         "deployment_id": os.getenv("WEBSITE_DEPLOYMENT_ID"),
     }
-

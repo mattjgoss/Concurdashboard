@@ -6,23 +6,57 @@ import requests
 from azure.identity import DefaultAzureCredential
 from azure.keyvault.secrets import SecretClient
 
-from app.auth.concur_oauth import ConcurOAuthClient
+from auth.concur_oauth import ConcurOAuthClient
 
 # ======================================================
-# KEY VAULT (Managed Identity) + caching
+# KEY VAULT (Managed Identity) + caching (Phase 1 safe)
 # ======================================================
 
-KEYVAULT_NAME = os.getenv("KEYVAULT_NAME")
-if not KEYVAULT_NAME:
-    raise RuntimeError("KEYVAULT_NAME environment variable is not set in App Service.")
+KEYVAULT_NAME = os.getenv("KEYVAULT_NAME")  # may be None in Phase 1; do NOT crash at import time
+KEYVAULT_URL = f"https://{KEYVAULT_NAME}.vault.azure.net/" if KEYVAULT_NAME else None
 
-KEYVAULT_URL = f"https://{KEYVAULT_NAME}.vault.azure.net/"
-
-_credential = DefaultAzureCredential()
-_secret_client = SecretClient(vault_url=KEYVAULT_URL, credential=_credential)
+_credential: Optional[DefaultAzureCredential] = None
+_secret_client: Optional[SecretClient] = None
 
 _SECRET_CACHE: Dict[str, Dict[str, object]] = {}
-_SECRET_TTL_SECONDS = 300  # 5 minutes
+_SECRET_TTL_SECONDS = int(os.getenv("SECRET_TTL_SECONDS", "300"))  # default 5 mins
+
+
+def _get_secret_client() -> SecretClient:
+    """
+    Lazily create a Key Vault SecretClient.
+    Phase 1 requirement: app must start even if KEYVAULT_NAME is not set yet.
+    """
+    global _credential, _secret_client
+
+    if not KEYVAULT_NAME:
+        raise RuntimeError("KEYVAULT_NAME environment variable is not set in App Service.")
+
+    if not KEYVAULT_URL:
+        # Defensive; should never happen if KEYVAULT_NAME is set
+        raise RuntimeError("KEYVAULT_URL could not be constructed from KEYVAULT_NAME.")
+
+    if _secret_client is None:
+        _credential = DefaultAzureCredential()
+        _secret_client = SecretClient(vault_url=KEYVAULT_URL, credential=_credential)
+
+    return _secret_client
+
+
+def keyvault_status() -> Dict[str, object]:
+    """
+    Lightweight status info for diagnostics (e.g. /kv-test).
+    Does not call Key Vault; just reports readiness/config.
+    """
+    return {
+        "keyvault_name_set": bool(KEYVAULT_NAME),
+        "keyvault_name": KEYVAULT_NAME,
+        "keyvault_url": KEYVAULT_URL,
+        "client_initialized": _secret_client is not None,
+        "cache_size": len(_SECRET_CACHE),
+        "cache_ttl_seconds": _SECRET_TTL_SECONDS,
+    }
+
 
 def get_secret(name: str) -> str:
     """
@@ -35,9 +69,12 @@ def get_secret(name: str) -> str:
     if cached and (now - float(cached["ts"])) < _SECRET_TTL_SECONDS:
         return str(cached["value"])
 
-    value = _secret_client.get_secret(name).value
+    client = _get_secret_client()
+    value = client.get_secret(name).value
+
     _SECRET_CACHE[name] = {"value": value, "ts": now}
     return str(value)
+
 
 def concur_base_url() -> str:
     """
@@ -58,7 +95,7 @@ class IdentityService:
 
     This service:
       - Uses ConcurOAuthClient for access tokens
-      - Uses Key Vault (via get_secret) for the Concur base URL (optional)
+      - Optionally uses Key Vault for the Concur base URL (concur-api-base-url)
       - Supports SCIM pagination to handle large result sets
     """
 
@@ -95,8 +132,11 @@ class IdentityService:
         Returns:
             List[Dict] of user objects (Resources).
         """
+        if use_keyvault_base_url:
+            base_url = concur_base_url()
+        else:
+            base_url = str(self.oauth.base_url).rstrip("/")
 
-        base_url = concur_base_url() if use_keyvault_base_url else str(self.oauth.base_url).rstrip("/")
         url = f"{base_url}/profile/identity/v4.1/Users"
 
         attrs = attributes or (
