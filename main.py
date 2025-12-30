@@ -402,7 +402,11 @@ def build():
 def concur_auth_test():
     # 1) Load secrets from Key Vault via your kv() helper
     base_url = kv("concur-api-base-url")  # e.g. https://us.api.concursolutions.com
-    token_url = kv("concur-token-url") if has_kv("concur-token-url") else f"{base_url}/oauth2/v0/token"
+    try:
+    token_url = kv("concur-token-url")
+except Exception:
+    token_url = f"{base_url}/oauth2/v0/token"
+
     client_id = kv("concur-client-id")
     client_secret = kv("concur-client-secret")
     refresh_token = kv("concur-refresh-token")
