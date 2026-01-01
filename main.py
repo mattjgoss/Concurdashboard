@@ -1,15 +1,14 @@
+# main.py (FULL REWRITE - DROP-IN REPLACEMENT)
+
 print("#### LOADED MAIN FROM:", __file__)
 import os, sys
-import time
-from collections import defaultdict
-from datetime import datetime, date
+from datetime import datetime
 from io import BytesIO
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
-from fastapi.middleware.cors import CORSMiddleware
 import requests
-from dateutil.parser import isoparse
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -19,9 +18,10 @@ from auth.azure_ad import get_current_user, get_azure_ad_config_status
 # Concur OAuth refresh-token client
 from auth.concur_oauth import ConcurOAuthClient
 
-# Local helpers
+# Key Vault + Excel export
 from services.identity_service import get_secret, keyvault_status
 from services.excel_export import export_accruals_to_excel
+
 
 BUILD_FINGERPRINT = os.getenv("SCM_COMMIT_ID") or os.getenv("WEBSITE_DEPLOYMENT_ID") or "unknown"
 print("RUN_FROM_PACKAGE =", os.getenv("WEBSITE_RUN_FROM_PACKAGE"))
@@ -50,7 +50,7 @@ def env(name: str, fallback: Optional[str] = None) -> Optional[str]:
 def kv(name: str, fallback: Optional[str] = None) -> Optional[str]:
     """
     Read a secret from Key Vault if available; otherwise return fallback.
-    Note: services.identity_service.get_secret(name) has no fallback argument.
+    Note: services.identity_service.get_secret(name) does not accept a fallback parameter.
     """
     try:
         return get_secret(name)
@@ -58,8 +58,17 @@ def kv(name: str, fallback: Optional[str] = None) -> Optional[str]:
         return fallback
 
 def concur_base_url() -> str:
-    # Concur API base (some tenants may use region-specific domains)
-    return (kv("CONCUR_BASE_URL", env("CONCUR_BASE_URL", "https://www.concursolutions.com")) or "").rstrip("/")
+    """
+    Concur API base URL.
+    Prefer Key Vault secret name: 'concur-api-base-url'
+    Fallback to env names: CONCUR_API_BASE_URL then CONCUR_BASE_URL then default.
+    """
+    return (
+        kv("concur-api-base-url")
+        or env("CONCUR_API_BASE_URL")
+        or env("CONCUR_BASE_URL")
+        or "https://www.concursolutions.com"
+    ).rstrip("/")
 
 # ======================================================
 # CONCUR OAUTH CLIENT (cached in-process)
@@ -70,21 +79,37 @@ _oauth_client: Optional[ConcurOAuthClient] = None
 def get_oauth_client() -> ConcurOAuthClient:
     """
     Build and cache a ConcurOAuthClient once per process.
-    Reads config from Key Vault first, then env.
+    Prefer Key Vault secret names (hyphenated):
+      - concur-token-url
+      - concur-client-id
+      - concur-client-secret
+      - concur-refresh-token
+    Fallback to env vars:
+      - CONCUR_TOKEN_URL, CONCUR_CLIENT_ID, CONCUR_CLIENT_SECRET, CONCUR_REFRESH_TOKEN
     """
     global _oauth_client
     if _oauth_client is not None:
         return _oauth_client
 
-    token_url = kv("CONCUR_TOKEN_URL", env("CONCUR_TOKEN_URL"))
-    client_id = kv("CONCUR_CLIENT_ID", env("CONCUR_CLIENT_ID"))
-    client_secret = kv("CONCUR_CLIENT_SECRET", env("CONCUR_CLIENT_SECRET"))
-    refresh_token = kv("CONCUR_REFRESH_TOKEN", env("CONCUR_REFRESH_TOKEN"))
+    token_url = kv("concur-token-url") or env("CONCUR_TOKEN_URL")
+    client_id = kv("concur-client-id") or env("CONCUR_CLIENT_ID")
+    client_secret = kv("concur-client-secret") or env("CONCUR_CLIENT_SECRET")
+    refresh_token = kv("concur-refresh-token") or env("CONCUR_REFRESH_TOKEN")
 
-    if not token_url or not client_id or not client_secret or not refresh_token:
+    missing = []
+    if not token_url:
+        missing.append("concur-token-url / CONCUR_TOKEN_URL")
+    if not client_id:
+        missing.append("concur-client-id / CONCUR_CLIENT_ID")
+    if not client_secret:
+        missing.append("concur-client-secret / CONCUR_CLIENT_SECRET")
+    if not refresh_token:
+        missing.append("concur-refresh-token / CONCUR_REFRESH_TOKEN")
+
+    if missing:
         raise HTTPException(
             status_code=500,
-            detail="Missing Concur OAuth config. Need CONCUR_TOKEN_URL/CONCUR_CLIENT_ID/CONCUR_CLIENT_SECRET/CONCUR_REFRESH_TOKEN (KV or env)."
+            detail=f"Missing Concur OAuth config (KV or env). Missing: {missing}"
         )
 
     _oauth_client = ConcurOAuthClient(
@@ -105,6 +130,26 @@ def concur_headers() -> Dict[str, str]:
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
     }
+
+def concur_auth_test() -> Dict[str, Any]:
+    """
+    Smoke test for Concur authentication:
+    - Forces OAuth token retrieval/refresh
+    - Calls a lightweight Concur endpoint (Identity Users count=1)
+    """
+    headers = concur_headers()
+    url = f"{concur_base_url()}/profile/identity/v4.1/Users"
+    resp = requests.get(url, headers=headers, params={"count": 1}, timeout=30)
+
+    if resp.ok:
+        try:
+            j = resp.json() or {}
+            resources = j.get("Resources", []) if isinstance(j, dict) else []
+            return {"status_code": resp.status_code, "ok": True, "sample": resources[:1]}
+        except Exception:
+            return {"status_code": resp.status_code, "ok": True, "sample": resp.text[:500]}
+    else:
+        return {"status_code": resp.status_code, "ok": False, "error": resp.text[:1000]}
 
 # ======================================================
 # CORS
@@ -143,6 +188,17 @@ def kv_test():
 def auth_config_status():
     return get_azure_ad_config_status()
 
+@app.get("/api/concur/auth-test")
+def api_concur_auth_test():
+    """
+    Test Concur OAuth + outbound API access.
+    Appears in /docs.
+    """
+    try:
+        return concur_auth_test()
+    except Exception as ex:
+        raise HTTPException(status_code=500, detail=str(ex))
+
 # ======================================================
 # REQUEST MODELS
 # ======================================================
@@ -159,65 +215,212 @@ class AccrualsSearchRequest(BaseModel):
 class UnassignedCardsRequest(BaseModel):
     transactionDateFrom: str  # YYYY-MM-DD
     transactionDateTo: str    # YYYY-MM-DD
-    dateType: str = "TRANSACTION"  # TRANSACTION | POSTED | BILLING (mainly for metadata/export)
+    dateType: str = "TRANSACTION"  # TRANSACTION | POSTED | BILLING (metadata/export)
     pageSize: int = 200  # capped in code
 
 # ======================================================
-# IDENTITY v4.1 (USER RESOLUTION)
+# IDENTITY v4.1 (NO FILTER - TENANT SAFE)
 # ======================================================
 
-def build_identity_filter(req: Any) -> Optional[str]:
-    parts = []
-    if getattr(req, "orgUnit1", None):
-        parts.append(f'urn:ietf:params:scim:schemas:extension:concur:2.0:User:orgUnit1 eq "{req.orgUnit1}"')
-    if getattr(req, "orgUnit2", None):
-        parts.append(f'urn:ietf:params:scim:schemas:extension:concur:2.0:User:orgUnit2 eq "{req.orgUnit2}"')
-    if getattr(req, "orgUnit3", None):
-        parts.append(f'urn:ietf:params:scim:schemas:extension:concur:2.0:User:orgUnit3 eq "{req.orgUnit3}"')
-    if getattr(req, "orgUnit4", None):
-        parts.append(f'urn:ietf:params:scim:schemas:extension:concur:2.0:User:orgUnit4 eq "{req.orgUnit4}"')
-    if getattr(req, "orgUnit5", None):
-        parts.append(f'urn:ietf:params:scim:schemas:extension:concur:2.0:User:orgUnit5 eq "{req.orgUnit5}"')
-    if getattr(req, "orgUnit6", None):
-        parts.append(f'urn:ietf:params:scim:schemas:extension:concur:2.0:User:orgUnit6 eq "{req.orgUnit6}"')
-    if getattr(req, "custom21", None):
-        parts.append(f'urn:ietf:params:scim:schemas:extension:concur:2.0:User:custom21 eq "{req.custom21}"')
-
-    if not parts:
-        return None
-    return " and ".join(parts)
-
-def get_users(req: Any) -> List[Dict]:
+def _identity_list_users_paged(
+    *,
+    attributes: str,
+    count: int = 200,
+    max_pages: int = 200,
+) -> List[Dict[str, Any]]:
+    """
+    List users using Identity v4.1 WITHOUT SCIM filter=.
+    Paginates via startIndex/count until exhausted or max_pages reached.
+    """
     url = f"{concur_base_url()}/profile/identity/v4.1/Users"
-    params: Dict[str, Any] = {"startIndex": 1, "count": 100}
-    flt = build_identity_filter(req)
-    if flt:
-        params["filter"] = flt
+    all_users: List[Dict[str, Any]] = []
 
-    resp = requests.get(url, headers=concur_headers(), params=params, timeout=30)
-    resp.raise_for_status()
-    return resp.json().get("Resources", []) or []
+    start_index = 1
+    page = 0
+
+    while page < max_pages:
+        params: Dict[str, Any] = {
+            "attributes": attributes,
+            "startIndex": start_index,
+            "count": count,
+        }
+        resp = requests.get(url, headers=concur_headers(), params=params, timeout=30)
+        resp.raise_for_status()
+
+        payload = resp.json() or {}
+        resources = payload.get("Resources") or []
+        if not isinstance(resources, list) or not resources:
+            break
+
+        all_users.extend(resources)
+
+        # SCIM paging fields (Identity v4.1 typically returns these)
+        total_results = int(payload.get("totalResults") or 0)
+        items_per_page = int(payload.get("itemsPerPage") or len(resources) or 0)
+
+        # Advance start index
+        start_index += max(items_per_page, 1)
+        page += 1
+
+        # Stop if server told us the total and we've passed it
+        if total_results and start_index > total_results:
+            break
+
+        # Safety: if server doesn't return stable paging fields, stop on short page
+        if len(resources) < count:
+            break
+
+    return all_users
+
+def _lower(s: Optional[str]) -> str:
+    return (s or "").strip().lower()
+
+def _extract_primary_email(user: Dict[str, Any]) -> Optional[str]:
+    emails = user.get("emails") or []
+    if isinstance(emails, list):
+        for e in emails:
+            if isinstance(e, dict) and e.get("value"):
+                return str(e.get("value"))
+    return None
 
 def get_concur_user_id_for_upn(upn_or_email: str) -> str:
     """
-    Resolve the current Entra user (UPN/email) to a single Concur userId (UUID)
-    using the Identity v4.1 SCIM endpoint.
+    Resolve Entra UPN/email to Concur userId WITHOUT SCIM filter= (tenant-safe).
+    Uses list+scan with minimal attributes.
     """
     if not upn_or_email:
         raise HTTPException(status_code=400, detail="Missing user identity (UPN/email).")
 
-    url = f"{concur_base_url()}/profile/identity/v4.1/Users"
-    for flt in (f'userName eq "{upn_or_email}"', f'emails.value eq "{upn_or_email}"'):
-        params = {"filter": flt, "startIndex": 1, "count": 1}
-        resp = requests.get(url, headers=concur_headers(), params=params, timeout=30)
-        resp.raise_for_status()
-        resources = resp.json().get("Resources", []) or []
-        if resources and isinstance(resources, list):
-            user_id = resources[0].get("id")
+    needle = _lower(upn_or_email)
+
+    attrs = "id,userName,emails.value,active"
+    users = _identity_list_users_paged(attributes=attrs, count=200, max_pages=200)
+
+    # First pass: match userName
+    for u in users:
+        if _lower(u.get("userName")) == needle:
+            user_id = u.get("id")
             if user_id:
-                return user_id
+                return str(user_id)
+
+    # Second pass: match any email
+    for u in users:
+        email = _extract_primary_email(u)
+        if _lower(email) == needle:
+            user_id = u.get("id")
+            if user_id:
+                return str(user_id)
 
     raise HTTPException(status_code=404, detail=f"Concur user not found for {upn_or_email}")
+
+def _matches_org_filters(user: Dict[str, Any], req: Any) -> bool:
+    """
+    Local filtering (since SCIM filter= breaks on this tenant).
+    Checks orgUnit1-6 and custom21 against the Concur user extension if present.
+    """
+    ext = user.get("urn:ietf:params:scim:schemas:extension:concur:2.0:User") or {}
+    if not isinstance(ext, dict):
+        ext = {}
+
+    # Only enforce fields that were provided
+    for k in ("orgUnit1","orgUnit2","orgUnit3","orgUnit4","orgUnit5","orgUnit6","custom21"):
+        want = getattr(req, k, None)
+        if want is not None and str(want).strip() != "":
+            have = ext.get(k)
+            if str(have).strip() != str(want).strip():
+                return False
+
+    return True
+
+def get_users(req: Any) -> List[Dict[str, Any]]:
+    """
+    Legacy helper used by /api/accruals/search.
+    Returns users using list+scan and optional local filtering.
+    """
+    attrs = (
+        "id,userName,displayName,active,emails.value,"
+        "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User,"
+        "urn:ietf:params:scim:schemas:extension:concur:2.0:User"
+    )
+    users = _identity_list_users_paged(attributes=attrs, count=200, max_pages=200)
+
+    # Apply local org filter if any fields were provided
+    filtered = [u for u in users if _matches_org_filters(u, req)]
+    return filtered
+
+# ======================================================
+# USERS ROUTES (FOR SHAREPOINT UI)
+# ======================================================
+
+def _to_grid_row(u: Dict[str, Any]) -> Dict[str, Any]:
+    enterprise = u.get("urn:ietf:params:scim:schemas:extension:enterprise:2.0:User") or {}
+    concur_ext = u.get("urn:ietf:params:scim:schemas:extension:concur:2.0:User") or {}
+    if not isinstance(enterprise, dict):
+        enterprise = {}
+    if not isinstance(concur_ext, dict):
+        concur_ext = {}
+
+    return {
+        "id": u.get("id"),
+        "displayName": u.get("displayName"),
+        "userName": u.get("userName"),
+        "email": _extract_primary_email(u),
+        "active": u.get("active"),
+        "employeeNumber": enterprise.get("employeeNumber"),
+        "orgUnit1": concur_ext.get("orgUnit1"),
+        "orgUnit2": concur_ext.get("orgUnit2"),
+        "orgUnit3": concur_ext.get("orgUnit3"),
+        "orgUnit4": concur_ext.get("orgUnit4"),
+        "orgUnit5": concur_ext.get("orgUnit5"),
+        "orgUnit6": concur_ext.get("orgUnit6"),
+        "custom21": concur_ext.get("custom21"),
+    }
+
+@app.get("/api/users")
+def api_users_list(
+    take: int = Query(500, ge=1, le=5000),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    SharePoint button: "Load Users"
+    Returns a grid-friendly list of users (no filter=, paged).
+    """
+    attrs = (
+        "id,userName,displayName,active,emails.value,"
+        "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User,"
+        "urn:ietf:params:scim:schemas:extension:concur:2.0:User"
+    )
+    users = _identity_list_users_paged(attributes=attrs, count=200, max_pages=200)
+    users = users[:take]
+
+    requested_by = current_user.get("upn") or current_user.get("preferred_username") or current_user.get("email")
+
+    return {
+        "meta": {
+            "requestedBy": requested_by,
+            "returned": len(users),
+        },
+        "users": [_to_grid_row(u) for u in users],
+    }
+
+@app.get("/api/users/{user_id}")
+def api_user_detail(
+    user_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    SharePoint row button: "View Details"
+    Returns the full SCIM record for a userId.
+    """
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+
+    url = f"{concur_base_url()}/profile/identity/v4.1/Users/{user_id}"
+    resp = requests.get(url, headers=concur_headers(), timeout=30)
+    if resp.status_code == 404:
+        raise HTTPException(status_code=404, detail="User not found in Concur Identity v4.1")
+    resp.raise_for_status()
+    return resp.json() or {}
 
 # ======================================================
 # EXPENSE REPORTS v4 (legacy for /api/accruals/search)
@@ -367,6 +570,7 @@ def api_cards_unassigned_search(req: UnassignedCardsRequest, current_user: Dict[
     if not upn:
         raise HTTPException(status_code=400, detail="Cannot determine current user identity (missing upn/preferred_username/email).")
 
+    # IMPORTANT: tenant-safe resolution (no filter=)
     concur_user_id = get_concur_user_id_for_upn(upn)
 
     txns = get_card_transactions(
@@ -411,14 +615,15 @@ def api_cards_unassigned_export(req: UnassignedCardsRequest, current_user: Dict[
     )
 
 # ======================================================
-# EXISTING LEGACY ENDPOINT (kept for now)
+# LEGACY ENDPOINT (kept for now)
 # ======================================================
 
 @app.post("/api/accruals/search")
 def api_accruals_search(req: AccrualsSearchRequest):
     """
-    Legacy endpoint kept as-is. Note: This does org-wide work and can be slow.
-    Prefer /api/cards/unassigned/search for SharePoint UI interactions.
+    Legacy endpoint kept as-is.
+    Note: This does org-wide work and can be slow.
+    Prefer /api/users and /api/users/{id} for SharePoint user UI.
     """
     users = get_users(req)
 
