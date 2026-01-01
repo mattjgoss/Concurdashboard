@@ -1,25 +1,35 @@
 print("#### LOADED MAIN FROM:", __file__)
-
-import os
+import os, sys
 import time
 from collections import defaultdict
 from datetime import datetime, date
 from io import BytesIO
 from typing import Optional, List, Dict, Any
 
+from fastapi.middleware.cors import CORSMiddleware
 import requests
 from dateutil.parser import isoparse
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import StreamingResponse
-from openpyxl import load_workbook
 from pydantic import BaseModel
 
-# IMPORTANT: requires services/__init__.py and services/identity_service.py in the zip
+# Azure AD authentication for SharePoint integration
+from auth.azure_ad import get_current_user, get_azure_ad_config_status
+
+# Concur OAuth refresh-token client
+from auth.concur_oauth import ConcurOAuthClient
+
+# Local helpers
 from services.identity_service import get_secret, keyvault_status
+from services.excel_export import export_accruals_to_excel
 
 BUILD_FINGERPRINT = os.getenv("SCM_COMMIT_ID") or os.getenv("WEBSITE_DEPLOYMENT_ID") or "unknown"
 print("RUN_FROM_PACKAGE =", os.getenv("WEBSITE_RUN_FROM_PACKAGE"))
 print("PWD =", os.getcwd())
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
 
 # ======================================================
 # FASTAPI APP
@@ -28,143 +38,110 @@ print("PWD =", os.getcwd())
 app = FastAPI(title="Concur Accruals API")
 
 # ======================================================
-# LOCAL FILES
-# ======================================================
-
-TEMPLATE_PATH = "reports/accrual report.xlsx"
-
-# ======================================================
 # HELPERS
 # ======================================================
 
-def safe_body(resp: requests.Response, limit: int = 1000) -> str:
-    """Return a safe, truncated response body for diagnostics."""
-    try:
-        txt = resp.text or ""
-        return txt[:limit]
-    except Exception:
-        return "<unreadable>"
-
-# ======================================================
-# KEY VAULT ACCESS (thin wrapper)
-# ======================================================
+def env(name: str, fallback: Optional[str] = None) -> Optional[str]:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return fallback
+    return v
 
 def kv(name: str, fallback: Optional[str] = None) -> Optional[str]:
     """
-    Fetch a secret from Key Vault (via services.identity_service.get_secret).
-    If Key Vault read fails or secret is missing/blank, return fallback.
+    Read a secret from Key Vault if available; otherwise return fallback.
+    Note: services.identity_service.get_secret(name) has no fallback argument.
     """
     try:
-        val = get_secret(name)
-        if val is None:
-            return fallback
-        if isinstance(val, str) and val.strip() == "":
-            return fallback
-        return val
+        return get_secret(name)
     except Exception:
         return fallback
 
 def concur_base_url() -> str:
-    # Example secret value: https://us2.api.concursolutions.com
-    base = kv("concur-api-base-url", os.getenv("CONCUR_API_BASE_URL"))
-    if not base:
-        raise HTTPException(status_code=500, detail={
-            "status": "error",
-            "error": "missing_config",
-            "missing": ["concur-api-base-url / CONCUR_API_BASE_URL"],
-        })
-    return str(base).rstrip("/")
-
-def concur_token_url() -> str:
-    # Example secret value: https://us2.api.concursolutions.com/oauth2/v0/token
-    # If not set, derive from base URL.
-    token = kv("concur-token-url", os.getenv("CONCUR_TOKEN_URL"))
-    if token:
-        return str(token).rstrip("/")
-    return f"{concur_base_url()}/oauth2/v0/token"
+    # Concur API base (some tenants may use region-specific domains)
+    return (kv("CONCUR_BASE_URL", env("CONCUR_BASE_URL", "https://www.concursolutions.com")) or "").rstrip("/")
 
 # ======================================================
-# CONCUR OAUTH (REFRESH TOKEN FLOW)
+# CONCUR OAUTH CLIENT (cached in-process)
 # ======================================================
 
-class ConcurOAuthClient:
-    def __init__(self):
-        self.access_token: Optional[str] = None
-        self.expires_at: float = 0.0
+_oauth_client: Optional[ConcurOAuthClient] = None
 
-    def get_access_token(self) -> str:
-        now = time.time()
-        if self.access_token and now < self.expires_at - 60:
-            return self.access_token
+def get_oauth_client() -> ConcurOAuthClient:
+    """
+    Build and cache a ConcurOAuthClient once per process.
+    Reads config from Key Vault first, then env.
+    """
+    global _oauth_client
+    if _oauth_client is not None:
+        return _oauth_client
 
-        token_url = concur_token_url()
+    token_url = kv("CONCUR_TOKEN_URL", env("CONCUR_TOKEN_URL"))
+    client_id = kv("CONCUR_CLIENT_ID", env("CONCUR_CLIENT_ID"))
+    client_secret = kv("CONCUR_CLIENT_SECRET", env("CONCUR_CLIENT_SECRET"))
+    refresh_token = kv("CONCUR_REFRESH_TOKEN", env("CONCUR_REFRESH_TOKEN"))
 
-        client_id = kv("concur-client-id", os.getenv("CONCUR_CLIENT_ID"))
-        client_secret = kv("concur-client-secret", os.getenv("CONCUR_CLIENT_SECRET"))
-        refresh_token = kv("concur-refresh-token", os.getenv("CONCUR_REFRESH_TOKEN"))
-
-        missing = [k for k, v in {
-            "concur-client-id / CONCUR_CLIENT_ID": client_id,
-            "concur-client-secret / CONCUR_CLIENT_SECRET": client_secret,
-            "concur-refresh-token / CONCUR_REFRESH_TOKEN": refresh_token,
-        }.items() if not v]
-        if missing:
-            raise HTTPException(status_code=500, detail={
-                "status": "error",
-                "error": "missing_config",
-                "missing": missing,
-            })
-
-        # Concur refresh-token flow: client_id/client_secret can be sent either in
-        # Authorization header (basic auth) or in form body depending on app config.
-        # Your earlier pattern used form fields; we keep it (works for many Concur apps).
-        resp = requests.post(
-            token_url,
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": client_id,
-                "client_secret": client_secret,
-            },
-            timeout=20,
+    if not token_url or not client_id or not client_secret or not refresh_token:
+        raise HTTPException(
+            status_code=500,
+            detail="Missing Concur OAuth config. Need CONCUR_TOKEN_URL/CONCUR_CLIENT_ID/CONCUR_CLIENT_SECRET/CONCUR_REFRESH_TOKEN (KV or env)."
         )
 
-        if resp.status_code in (400, 401, 403):
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "stage": "token",
-                    "error": "concur_oauth_failed",
-                    "status_code": resp.status_code,
-                    "token_endpoint": token_url,
-                    "body": safe_body(resp),
-                    "hint": "Check Key Vault secrets + Concur app refresh token + client credentials.",
-                },
-            )
-
-        resp.raise_for_status()
-        data = resp.json()
-
-        if "access_token" not in data:
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "stage": "token",
-                    "error": "no_access_token_in_response",
-                    "token_endpoint": token_url,
-                    "token_response_keys": list(data.keys()),
-                    "body": safe_body(resp),
-                },
-            )
-
-        self.access_token = data["access_token"]
-        self.expires_at = now + float(data.get("expires_in", 1800))
-        return self.access_token
-
-oauth = ConcurOAuthClient()
+    _oauth_client = ConcurOAuthClient(
+        token_url=token_url,
+        client_id=client_id,
+        client_secret=client_secret,
+        refresh_token=refresh_token,
+    )
+    return _oauth_client
 
 def concur_headers() -> Dict[str, str]:
-    return {"Authorization": f"Bearer {oauth.get_access_token()}", "Accept": "application/json"}
+    """
+    Always uses a valid Concur access token (refresh-token driven, cached in-process).
+    """
+    oauth = get_oauth_client()
+    token = oauth.get_access_token()
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+
+# ======================================================
+# CORS
+# ======================================================
+
+allowed_origin = env("SP_ORIGIN", "")  # e.g. https://<tenant>.sharepoint.com
+origins = [allowed_origin] if allowed_origin else ["*"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ======================================================
+# HEALTH / DEBUG
+# ======================================================
+
+@app.get("/build")
+def build():
+    return {
+        "fingerprint": BUILD_FINGERPRINT,
+        "run_from_package": env("WEBSITE_RUN_FROM_PACKAGE"),
+        "cwd": os.getcwd(),
+        "pythonpath0": sys.path[0] if sys.path else None,
+    }
+
+@app.get("/kv-test")
+def kv_test():
+    st = keyvault_status()
+    return {"status": "ok", "keyvault": st}
+
+@app.get("/auth/config-status")
+def auth_config_status():
+    return get_azure_ad_config_status()
 
 # ======================================================
 # REQUEST MODELS
@@ -179,50 +156,71 @@ class AccrualsSearchRequest(BaseModel):
     orgUnit6: Optional[str] = None
     custom21: Optional[str] = None
 
-class CardTotalsRequest(AccrualsSearchRequest):
-    transactionDateFrom: str
-    transactionDateTo: str
-    dateType: str  # TRANSACTION | POSTED | BILLING
+class UnassignedCardsRequest(BaseModel):
+    transactionDateFrom: str  # YYYY-MM-DD
+    transactionDateTo: str    # YYYY-MM-DD
+    dateType: str = "TRANSACTION"  # TRANSACTION | POSTED | BILLING (mainly for metadata/export)
+    pageSize: int = 200  # capped in code
 
 # ======================================================
 # IDENTITY v4.1 (USER RESOLUTION)
 # ======================================================
 
 def build_identity_filter(req: Any) -> Optional[str]:
-    filters = []
-
-    for i in range(1, 7):
-        val = getattr(req, f"orgUnit{i}", None)
-        if val:
-            filters.append(
-                f'urn:ietf:params:scim:schemas:extension:spend:2.0:User:orgUnit{i} eq "{val}"'
-            )
-
+    parts = []
+    if getattr(req, "orgUnit1", None):
+        parts.append(f'urn:ietf:params:scim:schemas:extension:concur:2.0:User:orgUnit1 eq "{req.orgUnit1}"')
+    if getattr(req, "orgUnit2", None):
+        parts.append(f'urn:ietf:params:scim:schemas:extension:concur:2.0:User:orgUnit2 eq "{req.orgUnit2}"')
+    if getattr(req, "orgUnit3", None):
+        parts.append(f'urn:ietf:params:scim:schemas:extension:concur:2.0:User:orgUnit3 eq "{req.orgUnit3}"')
+    if getattr(req, "orgUnit4", None):
+        parts.append(f'urn:ietf:params:scim:schemas:extension:concur:2.0:User:orgUnit4 eq "{req.orgUnit4}"')
+    if getattr(req, "orgUnit5", None):
+        parts.append(f'urn:ietf:params:scim:schemas:extension:concur:2.0:User:orgUnit5 eq "{req.orgUnit5}"')
+    if getattr(req, "orgUnit6", None):
+        parts.append(f'urn:ietf:params:scim:schemas:extension:concur:2.0:User:orgUnit6 eq "{req.orgUnit6}"')
     if getattr(req, "custom21", None):
-        filters.append(
-            'urn:ietf:params:scim:schemas:extension:spend:2.0:User:customData'
-            f'[id eq "custom21" and value eq "{req.custom21}"]'
-        )
+        parts.append(f'urn:ietf:params:scim:schemas:extension:concur:2.0:User:custom21 eq "{req.custom21}"')
 
-    return " and ".join(filters) if filters else None
+    if not parts:
+        return None
+    return " and ".join(parts)
 
-def get_users(filter_expression: Optional[str]) -> List[Dict]:
+def get_users(req: Any) -> List[Dict]:
     url = f"{concur_base_url()}/profile/identity/v4.1/Users"
-    params = {
-        "attributes": (
-            "id,displayName,userName,emails.value,"
-            "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"
-        )
-    }
-    if filter_expression:
-        params["filter"] = filter_expression
+    params: Dict[str, Any] = {"startIndex": 1, "count": 100}
+    flt = build_identity_filter(req)
+    if flt:
+        params["filter"] = flt
 
     resp = requests.get(url, headers=concur_headers(), params=params, timeout=30)
     resp.raise_for_status()
     return resp.json().get("Resources", []) or []
 
+def get_concur_user_id_for_upn(upn_or_email: str) -> str:
+    """
+    Resolve the current Entra user (UPN/email) to a single Concur userId (UUID)
+    using the Identity v4.1 SCIM endpoint.
+    """
+    if not upn_or_email:
+        raise HTTPException(status_code=400, detail="Missing user identity (UPN/email).")
+
+    url = f"{concur_base_url()}/profile/identity/v4.1/Users"
+    for flt in (f'userName eq "{upn_or_email}"', f'emails.value eq "{upn_or_email}"'):
+        params = {"filter": flt, "startIndex": 1, "count": 1}
+        resp = requests.get(url, headers=concur_headers(), params=params, timeout=30)
+        resp.raise_for_status()
+        resources = resp.json().get("Resources", []) or []
+        if resources and isinstance(resources, list):
+            user_id = resources[0].get("id")
+            if user_id:
+                return user_id
+
+    raise HTTPException(status_code=404, detail=f"Concur user not found for {upn_or_email}")
+
 # ======================================================
-# EXPENSE REPORTS v4
+# EXPENSE REPORTS v4 (legacy for /api/accruals/search)
 # ======================================================
 
 def get_expense_reports(user_id: str) -> List[Dict]:
@@ -234,21 +232,15 @@ def get_expense_reports(user_id: str) -> List[Dict]:
 def filter_unsubmitted_reports(reports: List[Dict]) -> List[Dict]:
     results = []
     for r in reports:
-        payment_status_id = r.get("paymentStatusId")
-
-        # Exclude reports already paid or processing
-        if payment_status_id in ("P_PAID", "P_PROC"):
+        if r.get("submitDate"):
             continue
-
         results.append(
             {
-                "lastName": r.get("owner", {}).get("lastName"),
-                "firstName": r.get("owner", {}).get("firstName"),
+                "reportId": r.get("reportId") or r.get("id"),
                 "reportName": r.get("name"),
-                "submitted": r.get("approvalStatus") == "Submitted",
-                "reportCreationDate": r.get("creationDate"),
+                "reportPurpose": r.get("purpose"),
                 "reportSubmissionDate": r.get("submitDate"),
-                "paymentStatusId": payment_status_id,
+                "paymentStatusId": (r.get("paymentStatus") or {}).get("id"),
                 "totalAmount": (r.get("totalAmount") or {}).get("value"),
             }
         )
@@ -258,278 +250,197 @@ def filter_unsubmitted_reports(reports: List[Dict]) -> List[Dict]:
 # CARDS v4
 # ======================================================
 
-def get_card_transactions(user_id: str, date_from: str, date_to: str) -> List[Dict]:
+def get_card_transactions(user_id: str, date_from: str, date_to: str, status: Optional[str] = None, page_size: int = 200) -> List[Dict]:
+    """
+    Fetch card transactions for a single user within a date window.
+
+    Defensive pagination:
+    - Iterates page/pageSize
+    - Stops if first transaction repeats (tenant ignores paging) to avoid infinite loop
+    """
     url = f"{concur_base_url()}/cards/v4/users/{user_id}/transactions"
-    params = {"transactionDateFrom": date_from, "transactionDateTo": date_to}
-    resp = requests.get(url, headers=concur_headers(), params=params, timeout=30)
-    resp.raise_for_status()
-    return resp.json().get("Items", []) or []
+
+    if page_size < 1:
+        page_size = 200
+    if page_size > 500:
+        page_size = 500
+
+    page = 1
+    seen_first_id: Optional[str] = None
+    all_items: List[Dict] = []
+
+    while True:
+        params: Dict[str, Any] = {
+            "transactionDateFrom": date_from,
+            "transactionDateTo": date_to,
+            "page": page,
+            "pageSize": page_size,
+        }
+        if status:
+            params["status"] = status
+
+        resp = requests.get(url, headers=concur_headers(), params=params, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json() or {}
+
+        items = (
+            payload.get("Items")
+            or payload.get("items")
+            or payload.get("Transactions")
+            or payload.get("transactions")
+            or []
+        )
+        if not isinstance(items, list):
+            raise HTTPException(status_code=500, detail="Unexpected Cards response shape (transactions is not a list).")
+
+        if not items:
+            break
+
+        first_id = str(items[0].get("id") or items[0].get("transactionId") or "")
+        if page > 1 and first_id and seen_first_id == first_id:
+            break
+        if page == 1 and first_id:
+            seen_first_id = first_id
+
+        all_items.extend(items)
+
+        if len(items) < page_size:
+            break
+
+        page += 1
+        if page > 100:  # hard guard
+            break
+
+    return all_items
 
 def filter_unassigned_cards(transactions: List[Dict]) -> List[Dict]:
-    results = []
+    """
+    A transaction is considered assigned if it has expenseId or reportId.
+    Return a UI-friendly shape used by SPFx + Excel export.
+    """
+    results: List[Dict] = []
     for t in transactions:
         if t.get("expenseId") or t.get("reportId"):
             continue
 
         account = t.get("account") or {}
         payment_type = account.get("paymentType") or {}
-
         posted = t.get("postedAmount") or {}
+        trans_amt = t.get("transactionAmount") or {}
+        billing_amt = t.get("billingAmount") or {}
+
         results.append(
             {
+                "transactionId": t.get("transactionId") or t.get("id"),
+
                 "cardProgramId": payment_type.get("id"),
-                "accountKey": account.get("lastSegment"),
+                "cardProgramName": payment_type.get("name"),
+                "accountKey": account.get("lastSegment") or account.get("accountKey"),
                 "lastFourDigits": account.get("lastFourDigits"),
+
+                "transactionDate": t.get("transactionDate"),
+                "postedDate": t.get("postedDate"),
+                "billingDate": t.get("billingDate"),
+
+                "merchantName": t.get("merchantName") or t.get("merchant"),
+                "description": t.get("description") or t.get("transactionDescription"),
+
                 "postedAmount": posted.get("value"),
-                "currencyCode": posted.get("currencyCode"),
+                "postedCurrencyCode": posted.get("currencyCode"),
+
+                "transactionAmount": trans_amt.get("value") if isinstance(trans_amt, dict) else trans_amt,
+                "transactionCurrencyCode": trans_amt.get("currencyCode") if isinstance(trans_amt, dict) else None,
+
+                "billingAmount": billing_amt.get("value") if isinstance(billing_amt, dict) else billing_amt,
+                "billingCurrencyCode": billing_amt.get("currencyCode") if isinstance(billing_amt, dict) else None,
             }
         )
     return results
 
 # ======================================================
-# CARD TOTALS LOGIC
+# UNASSIGNED CARDS (CURRENT USER) - SharePoint UI-first
 # ======================================================
 
-def extract_date(txn: Dict, date_type: str) -> date:
-    if date_type == "POSTED":
-        return isoparse(txn["postedDate"]).date()
-    if date_type == "BILLING":
-        return isoparse(txn["statement"]["billingDate"]).date()
-    return isoparse(txn["transactionDate"]).date()
+@app.post("/api/cards/unassigned/search")
+def api_cards_unassigned_search(req: UnassignedCardsRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    upn = current_user.get("upn") or current_user.get("preferred_username") or current_user.get("email")
+    if not upn:
+        raise HTTPException(status_code=400, detail="Cannot determine current user identity (missing upn/preferred_username/email).")
 
-def compute_card_totals(transactions: List[Dict], from_date: date, to_date: date, date_type: str):
-    by_program = defaultdict(lambda: {"count": 0, "total": 0.0, "currency": ""})
-    by_user = defaultdict(lambda: {"count": 0, "total": 0.0, "currency": ""})
+    concur_user_id = get_concur_user_id_for_upn(upn)
 
-    for t in transactions:
-        if date_type == "BILLING":
-            stmt = t.get("statement") or {}
-            if not stmt.get("billingDate"):
-                continue
-        if date_type == "POSTED" and not t.get("postedDate"):
-            continue
-        if date_type == "TRANSACTION" and not t.get("transactionDate"):
-            continue
+    txns = get_card_transactions(
+        concur_user_id,
+        req.transactionDateFrom,
+        req.transactionDateTo,
+        status="UN",
+        page_size=req.pageSize,
+    )
 
-        d = extract_date(t, date_type)
-        if not (from_date <= d <= to_date):
-            continue
-
-        posted_amount = t.get("postedAmount") or {}
-        amount = float(posted_amount.get("value") or 0.0)
-        currency = str(posted_amount.get("currencyCode") or "")
-
-        account = t.get("account") or {}
-        payment_type = account.get("paymentType") or {}
-        program = str(payment_type.get("id") or "")
-
-        employee_id = t.get("employeeId")
-        user_key = employee_id if employee_id else f'{account.get("lastSegment")} ({program})'
-
-        by_program[program]["count"] += 1
-        by_program[program]["total"] += amount
-        by_program[program]["currency"] = currency
-
-        by_user[user_key]["count"] += 1
-        by_user[user_key]["total"] += amount
-        by_user[user_key]["currency"] = currency
-
-    return {
-        "totalsByProgram": [{"cardProgramId": k, **v} for k, v in by_program.items()],
-        "totalsByUser": [{"userKey": k, **v} for k, v in by_user.items()],
-    }
-
-# ======================================================
-# EXCEL EXPORT
-# ======================================================
-
-def export_card_totals_excel(totals: Dict, meta: Dict) -> bytes:
-    wb = load_workbook(TEMPLATE_PATH)
-
-    ws = wb["Card totals"] if "Card totals" in wb.sheetnames else wb.create_sheet("Card totals")
-    ws.delete_rows(1, ws.max_row)
-
-    ws["A1"] = "Card totals"
-    ws["A2"] = f"Generated {datetime.now():%Y-%m-%d %H:%M}"
-    ws["A3"] = f'Date range: {meta["from"]} to {meta["to"]} ({meta["type"]})'
-
-    ws.append([])
-    ws.append(["Card program", "Count", "Total", "Currency"])
-
-    for p in totals["totalsByProgram"]:
-        ws.append([p.get("cardProgramId"), p.get("count"), p.get("total"), p.get("currency")])
-
-    ws.append([])
-    ws.append(["User key", "Count", "Total", "Currency"])
-
-    for u in totals["totalsByUser"]:
-        ws.append([u.get("userKey"), u.get("count"), u.get("total"), u.get("currency")])
-
-    out = BytesIO()
-    wb.save(out)
-    out.seek(0)
-    return out.read()
-
-# ======================================================
-# API ENDPOINTS
-# ======================================================
-
-@app.post("/api/accruals/search")
-def accruals_search(req: AccrualsSearchRequest):
-    filter_expr = build_identity_filter(req)
-    users = get_users(filter_expr)
-
-    unsubmitted_reports = []
-    unassigned_cards = []
-
-    for u in users:
-        reports = get_expense_reports(u["id"])
-        unsubmitted_reports.extend(filter_unsubmitted_reports(reports))
-
-        txns = get_card_transactions(u["id"], "2000-01-01", date.today().isoformat())
-        unassigned_cards.extend(filter_unassigned_cards(txns))
+    unassigned = filter_unassigned_cards(txns)
 
     return {
         "summary": {
-            "unsubmittedReportCount": len(unsubmitted_reports),
-            "unassignedCardCount": len(unassigned_cards),
+            "upn": upn,
+            "concurUserId": concur_user_id,
+            "dateFrom": req.transactionDateFrom,
+            "dateTo": req.transactionDateTo,
+            "unassignedCardCount": len(unassigned),
         },
-        "unsubmittedReports": unsubmitted_reports,
-        "unassignedCards": unassigned_cards,
+        "transactions": unassigned,
     }
 
-@app.post("/api/cardtotals/export")
-def card_totals_export(req: CardTotalsRequest):
-    date_type = (req.dateType or "").upper()
-    if date_type not in ("TRANSACTION", "POSTED", "BILLING"):
-        raise HTTPException(status_code=400, detail="dateType must be TRANSACTION, POSTED, or BILLING")
+@app.post("/api/cards/unassigned/export")
+def api_cards_unassigned_export(req: UnassignedCardsRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    data = api_cards_unassigned_search(req, current_user=current_user)
+    unassigned = data["transactions"]
 
-    filter_expr = build_identity_filter(req)
-    users = get_users(filter_expr)
-
-    all_txns = []
-    for u in users:
-        all_txns.extend(get_card_transactions(u["id"], req.transactionDateFrom, req.transactionDateTo))
-
-    totals = compute_card_totals(
-        all_txns,
-        date.fromisoformat(req.transactionDateFrom),
-        date.fromisoformat(req.transactionDateTo),
-        date_type,
+    excel_bytes = export_accruals_to_excel(
+        unsubmitted_reports=[],
+        unassigned_cards=unassigned,
+        card_totals_by_program=None,
+        card_totals_by_user=None,
+        meta={"dateFrom": req.transactionDateFrom, "dateTo": req.transactionDateTo, "dateType": req.dateType},
     )
 
-    xlsx = export_card_totals_excel(
-        totals,
-        {"from": req.transactionDateFrom, "to": req.transactionDateTo, "type": date_type},
-    )
-
-    filename = f"Concur_Card_Totals_{datetime.now():%Y%m%d_%H%M}.xlsx"
-
+    filename = f"Concur_Unassigned_Cards_{datetime.now():%Y%m%d_%H%M}.xlsx"
     return StreamingResponse(
-        BytesIO(xlsx),
+        BytesIO(excel_bytes),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
-@app.get("/kv-test")
-def kv_test():
+# ======================================================
+# EXISTING LEGACY ENDPOINT (kept for now)
+# ======================================================
+
+@app.post("/api/accruals/search")
+def api_accruals_search(req: AccrualsSearchRequest):
     """
-    Simple Key Vault read test.
-    Returns:
-      - status: ok (if read works)
-      - status: error (if KV config/MI/permissions fail)
+    Legacy endpoint kept as-is. Note: This does org-wide work and can be slow.
+    Prefer /api/cards/unassigned/search for SharePoint UI interactions.
     """
-    try:
-        client_id = kv("concur-client-id")
-        return {"status": "ok", "client_id_exists": bool(client_id), "keyvault": keyvault_status()}
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail={"message": f"Key Vault read failed: {str(e)}", "keyvault": keyvault_status()},
-        )
+    users = get_users(req)
 
-@app.get("/build")
-def build():
-    return {
-        "fingerprint": BUILD_FINGERPRINT,
-        "file": __file__,
-        "cwd": os.getcwd(),
-        "run_from_package": os.getenv("WEBSITE_RUN_FROM_PACKAGE"),
-        "scm_build": os.getenv("SCM_DO_BUILD_DURING_DEPLOYMENT"),
-        "scm_commit": os.getenv("SCM_COMMIT_ID"),
-        "deployment_id": os.getenv("WEBSITE_DEPLOYMENT_ID"),
-    }
+    unsubmitted_reports_all: List[Dict] = []
+    unassigned_cards_all: List[Dict] = []
 
-@app.get("/api/concur/auth-test")
-def concur_auth_test():
-    # 1) Load config/secrets (Key Vault first, env fallback)
-    base_url = kv("concur-api-base-url", os.getenv("CONCUR_API_BASE_URL"))
-    if not base_url:
-        raise HTTPException(status_code=500, detail={
-            "status": "error",
-            "error": "missing_config",
-            "missing": ["concur-api-base-url / CONCUR_API_BASE_URL"],
-        })
+    for u in users:
+        user_id = u.get("id")
+        if not user_id:
+            continue
 
-    token_url = kv("concur-token-url", os.getenv("CONCUR_TOKEN_URL")) or f"{str(base_url).rstrip('/')}/oauth2/v0/token"
+        reports = get_expense_reports(user_id)
+        unsubmitted_reports_all.extend(filter_unsubmitted_reports(reports))
 
-    client_id = kv("concur-client-id", os.getenv("CONCUR_CLIENT_ID"))
-    client_secret = kv("concur-client-secret", os.getenv("CONCUR_CLIENT_SECRET"))
-    refresh_token = kv("concur-refresh-token", os.getenv("CONCUR_REFRESH_TOKEN"))
+        # Legacy huge window (kept for backwards compatibility only)
+        txns = get_card_transactions(user_id, "2000-01-01", datetime.now().strftime("%Y-%m-%d"))
+        unassigned_cards_all.extend(filter_unassigned_cards(txns))
 
-    missing = [k for k, v in {
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "refresh_token": refresh_token,
-    }.items() if not v]
-    if missing:
-        raise HTTPException(status_code=500, detail={
-            "status": "error",
-            "error": "missing_config",
-            "missing": missing,
-        })
-
-    # 2) Refresh token -> access token
-    data = {"grant_type": "refresh_token", "refresh_token": refresh_token}
-
-    r = requests.post(token_url, data=data, auth=(client_id, client_secret), timeout=30)
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail={
-            "stage": "token",
-            "status_code": r.status_code,
-            "body": safe_body(r),
-            "token_endpoint": token_url,
-        })
-
-    tok = r.json()
-    access_token = tok.get("access_token")
-    if not access_token:
-        raise HTTPException(status_code=502, detail={
-            "stage": "token",
-            "error": "No access_token in response",
-            "token_response_keys": list(tok.keys()),
-        })
-
-    # 3) Call a lightweight Concur API endpoint (Identity)
-    url = f"{str(base_url).rstrip('/')}/profile/identity/v4.1/Users?startIndex=1&count=1"
-    h = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
-    u = requests.get(url, headers=h, timeout=30)
-
-    return {
-        "status": "ok" if u.status_code == 200 else "fail",
-        "token_endpoint": token_url,
-        "identity_test_url": url,
-        "identity_status_code": u.status_code,
-        "identity_snippet": (u.text or "")[:300],
-        "expires_in": tok.get("expires_in"),
-        "token_type": tok.get("token_type"),
-        "scope": tok.get("scope"),
-    }
-
-@app.get("/debug/routes")
-def debug_routes():
-    return sorted([getattr(r, "path", "") for r in app.router.routes])
-
-@app.get("/debug/deploy")
-def debug_deploy():
-    return {"deploy": "auth-test-v1", "utc": datetime.utcnow().isoformat() + "Z"}
+    excel_bytes = export_accruals_to_excel(unsubmitted_reports_all, unassigned_cards_all)
+    filename = f"Concur_Accruals_{datetime.now():%Y%m%d_%H%M}.xlsx"
+    return StreamingResponse(
+        BytesIO(excel_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
