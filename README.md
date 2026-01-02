@@ -1,4 +1,4 @@
-# Concur Users API - Technical Documentation
+# Concur Users API - Technical Documentation.
 
 **Version**: 4.0  
 **Last Updated**: 2026-01-02  
