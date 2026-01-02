@@ -2,7 +2,7 @@ name: Build & Deploy (FastAPI -> Azure App Service)
 
 on:
   push:
-    branches: ["main"]
+    branches: [ "main" ]
   workflow_dispatch:
 
 env:
@@ -17,50 +17,38 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python (build machine)
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
       - name: Verify expected structure
         run: |
-          set -e
           test -f main.py
           test -f requirements.txt
           test -d services
           test -d auth
           echo "Repo structure looks OK."
 
-      # Build dependencies into the folder Azure App Service expects for "zip deploy without Oryx"
-      - name: Build dependencies into .python_packages (no venv)
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies into .python_packages (Azure-compatible)
         run: |
-          set -e
-          python -m pip install --upgrade pip
           rm -rf .python_packages
-          mkdir -p .python_packages/lib/site-packages
-          python -m pip install -r requirements.txt -t .python_packages/lib/site-packages
-          echo "Built site-packages:"
-          ls -la .python_packages/lib/site-packages | head -n 50
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt --target ".python_packages/lib/site-packages"
+          python -c "import uvicorn, fastapi; print('uvicorn', uvicorn.__version__, 'fastapi', fastapi.__version__)"
 
-      - name: Create Linux-safe deployment ZIP (root-level, no antenv)
+      - name: Create deployment ZIP (includes .python_packages)
         run: |
-          set -e
           rm -f "${ZIP_NAME}"
-
-          # Zip ONLY what we need. Do NOT include antenv or any local venv.
           zip -r "${ZIP_NAME}" \
             main.py requirements.txt \
             services auth reports exports logic models \
             .python_packages \
-            -x "**/__pycache__/*" "*.pyc" \
-               "antenv/*" "**/antenv/*" \
-               ".git/*" ".github/*"
-
-          echo "ZIP content (top 80 lines):"
+            -x "**/__pycache__/*" "*.pyc" ".git/*" ".github/*"
+          echo "ZIP content check:"
           unzip -l "${ZIP_NAME}" | head -n 80
-
-          echo "Confirm critical items exist:"
-          unzip -l "${ZIP_NAME}" | grep -E "main.py$|requirements.txt$|\.python_packages/"
+          echo "Confirm uvicorn packaged:"
+          unzip -l "${ZIP_NAME}" | grep -i "uvicorn" | head -n 20
 
       - name: Deploy to Azure Web App (zip)
         uses: azure/webapps-deploy@v3
