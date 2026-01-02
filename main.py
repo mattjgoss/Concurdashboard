@@ -64,6 +64,17 @@ def concur_base_url() -> str:
     ).rstrip("/")
 
 
+def api_app_id() -> str:
+    """
+    Entra App ID (Application ID) for THIS FastAPI backend (the API resource).
+    Needed to generate user tokens via az CLI for Swagger testing.
+
+    Prefer env: API_APP_ID
+    Fallback Key Vault: 'api-app-id'
+    """
+    return (env("API_APP_ID") or kv("api-app-id") or "").strip()
+
+
 # ======================================================
 # CONCUR OAUTH CLIENT (cached)
 # ======================================================
@@ -224,6 +235,58 @@ def api_concur_auth_test():
 
     payload = resp.json() if resp.content else {}
     return {"ok": True, "status_code": resp.status_code, "base_url": base, "sample": (payload.get("Resources") or [])[:1]}
+
+
+# ======================================================
+# NEW: Swagger helper endpoints (SAFE)
+# ======================================================
+
+@app.get("/api/tools/token-command")
+def token_command():
+    """
+    Returns COPY/PASTE commands to obtain an Entra user bearer token for this API.
+    IMPORTANT: This endpoint does NOT return a token value.
+    """
+    app_id = api_app_id() or "648a2fa4-dc6d-429c-8c50-ce51f48beb24"  # fallback to your known App ID
+    host = env("WEBSITE_HOSTNAME") or env("APP_HOSTNAME") or ""
+    base = f"https://{host}".rstrip("/") if host else ""
+
+    return {
+        "note": "Run these commands in Azure Cloud Shell or a local terminal. Do NOT paste the token into chat/Yammer. Paste into Swagger Authorize as: Bearer <token>.",
+        "apiAppId": app_id,
+        "swaggerUrl": f"{base}/docs" if base else "/docs",
+        "cloudShell_bash": [
+            f'API_APP_ID="{app_id}"',
+            'TOKEN=$(az account get-access-token --resource "api://$API_APP_ID" --query accessToken -o tsv)',
+            'echo "${TOKEN:0:30}..."',
+            'echo "Paste into Swagger Authorize as: Bearer $TOKEN"',
+        ],
+        "powershell": [
+            f'$API_APP_ID="{app_id}"',
+            '$TOKEN = az account get-access-token --resource "api://$API_APP_ID" --query accessToken -o tsv',
+            '$TOKEN.Substring(0,30) + "..."',
+            'Write-Host "Paste into Swagger Authorize as: Bearer $TOKEN"',
+        ],
+    }
+
+
+@app.get("/api/tools/swagger-howto")
+def swagger_howto():
+    """
+    Returns the exact steps to run secured endpoints in Swagger UI (/docs).
+    """
+    host = env("WEBSITE_HOSTNAME") or env("APP_HOSTNAME") or ""
+    base = f"https://{host}".rstrip("/") if host else ""
+    return {
+        "swaggerUrl": f"{base}/docs" if base else "/docs",
+        "steps": [
+            "1) Get a bearer token using /api/tools/token-command (copy/paste the bash or PowerShell commands into Cloud Shell or your terminal).",
+            "2) Open /docs and click Authorize (top right).",
+            "3) Paste: Bearer <token> (include the word Bearer). Click Authorize then Close.",
+            "4) Now you can Try it out + Execute on any secured endpoint (/api/whoami, /api/users, /api/users/{id}/full, etc).",
+        ],
+        "security_note": "Swagger UI cannot mint tokens. Tokens must come from Entra (az CLI, MSAL, etc.). The API should not expose an endpoint that returns tokens.",
+    }
 
 
 # ======================================================
@@ -423,7 +486,7 @@ def get_user_detail_identity(user_id: str) -> Dict[str, Any]:
 
 
 # ======================================================
-# FULL PROFILE HELPERS (Identity + Spend + Travel)
+# FULL PROFILE HELPERS (Identity + Spend + Travel + List expansion)
 # ======================================================
 
 def get_user_detail_spend(user_id: str) -> Dict[str, Any]:
@@ -575,9 +638,6 @@ def expand_list_items_from_spend(spend_payload: Optional[Dict[str, Any]], *, lim
 
 
 def _summarise_list_item(item: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Produces a stable, UI-friendly summary for a List item payload.
-    """
     if not isinstance(item, dict):
         return {}
 
@@ -602,12 +662,6 @@ def _summarise_list_item(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_resolved_from_expanded_list_items(items_by_key: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Turn expanded list item payloads into:
-      resolved.orgUnits.orgUnitX = summary
-      resolved.custom.customX = summary
-    keyed by the Spend customData fieldId (orgUnit1..6, custom1..22).
-    """
     resolved = {"orgUnits": {}, "custom": {}}
     if not isinstance(items_by_key, dict):
         return resolved
@@ -628,7 +682,6 @@ def build_resolved_from_expanded_list_items(items_by_key: Dict[str, Any]) -> Dic
         elif field_id.startswith("custom"):
             resolved["custom"][field_id] = summary
 
-    # ensure key presence
     for i in range(1, 7):
         resolved["orgUnits"].setdefault(f"orgUnit{i}", None)
     for i in range(1, 23):
@@ -679,7 +732,7 @@ def api_user_detail(
 @app.get("/api/users/{user_id}/full")
 def api_user_detail_full(
     user_id: str,
-    expand: Optional[str] = Query(None, description="Optional expansions, e.g. 'listItems' or 'listItems,other'"),
+    expand: Optional[str] = Query(None, description="Optional expansions, e.g. 'listItems'"),
     expandLimit: int = Query(50, ge=0, le=200, description="Max list items to expand (safety cap)"),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
@@ -725,8 +778,8 @@ def api_user_detail_full(
     combined["_derived"] = _materialise_custom_fields_from_spend(spend if isinstance(spend, dict) else None)
 
     expanded: Dict[str, Any] = {}
-
     expansions = _parse_expand(expand)
+
     if "listItems" in expansions:
         if isinstance(spend, dict):
             items, errors = expand_list_items_from_spend(spend, limit=expandLimit)
@@ -738,11 +791,7 @@ def api_user_detail_full(
                 "errors": len(errors),
                 "limit": expandLimit,
             }
-
-            # NEW: resolved (fieldId -> list item summary)
-            resolved = build_resolved_from_expanded_list_items(items)
-            combined["_derived"]["resolved"] = resolved
-
+            combined["_derived"]["resolved"] = build_resolved_from_expanded_list_items(items)
         else:
             expanded["listItems"] = {}
             expanded["listItemsErrors"] = {}
@@ -786,7 +835,7 @@ def api_users_export(
         card_totals_by_program=None,
         card_totals_by_user=None,
         meta={"export": "users", "attributeMode": mode, "returned": len(rows)},
-        extra_sheets={"Users": rows},  # if your excel_export supports it; if not, remove this line
+        extra_sheets={"Users": rows},
     )
 
     filename = f"Concur_Users_{datetime.now():%Y%m%d_%H%M}.xlsx"
