@@ -268,7 +268,6 @@ def token_command():
     host = env("WEBSITE_HOSTNAME") or env("APP_HOSTNAME") or ""
     base = f"https://{host}".rstrip("/") if host else ""
 
-    # NOTE: no leading '#' comment lines to avoid confusion when copying out of Swagger
     bash_block = f"""API_APP_ID="{app_id}"
 TOKEN=$(az account get-access-token --scope "api://$API_APP_ID/.default" --query accessToken -o tsv)
 echo "$TOKEN"
@@ -327,17 +326,23 @@ class UnassignedCardsRequest(BaseModel):
 # ======================================================
 # IDENTITY HELPERS (tenant-safe attributes fallback)
 # ======================================================
+#
+# IMPORTANT:
+# - Concur tenants differ in what they accept in the SCIM "attributes" parameter.
+# - Some tenants reject 'groups' (as you saw: BAD_QUERY Unrecognized attributes: groups).
+# - We DO NOT include 'groups' in the list endpoints to keep this tenant-safe.
+#
 
 ATTRS_WITH_CONCUR_EXT = (
     "id,userName,displayName,active,"
-    "name,emails,phoneNumbers,addresses,timezone,locale,preferredLanguage,groups,meta,"
+    "name,emails,phoneNumbers,addresses,timezone,locale,preferredLanguage,meta,"
     "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User,"
     "urn:ietf:params:scim:schemas:extension:concur:2.0:User"
 )
 
 ATTRS_NO_CONCUR_EXT = (
     "id,userName,displayName,active,"
-    "name,emails,phoneNumbers,addresses,timezone,locale,preferredLanguage,groups,meta,"
+    "name,emails,phoneNumbers,addresses,timezone,locale,preferredLanguage,meta,"
     "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"
 )
 
@@ -368,19 +373,30 @@ def _to_grid_row_identity(u: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _extract_unrecognized_attribute(resp: requests.Response) -> Optional[str]:
+def _extract_unrecognized_attribute_from_text(resp: requests.Response) -> Optional[str]:
+    """
+    Concur error formats vary.
+    We reliably catch: 'Unrecognized attributes: groups'
+    """
+    text = resp.text or ""
+    marker = "Unrecognized attributes:"
+    if marker in text:
+        tail = text.split(marker, 1)[1].strip()
+        if tail:
+            return tail.split(",")[0].strip()
+
+    # Some tenants put the message inside JSON "detail"
     try:
         j = resp.json() or {}
         detail = str(j.get("detail") or "")
+        if marker in detail:
+            tail = detail.split(marker, 1)[1].strip()
+            if tail:
+                return tail.split(",")[0].strip()
     except Exception:
-        detail = ""
-    marker = "Unrecognized attributes:"
-    if marker not in detail:
-        return None
-    tail = detail.split(marker, 1)[1].strip()
-    if not tail:
-        return None
-    return tail.split(",")[0].strip()
+        pass
+
+    return None
 
 
 def _remove_attribute_from_list(attr_string: str, attr_to_remove: str) -> str:
@@ -390,8 +406,17 @@ def _remove_attribute_from_list(attr_string: str, attr_to_remove: str) -> str:
 
 
 def _identity_list_users_paged(
-    *, attributes: str, count: int = 200, max_pages: int = 200
-) -> List[Dict[str, Any]]:
+    *,
+    attributes: str,
+    count: int = 200,
+    max_pages: int = 200,
+    max_attr_fixes: int = 6,
+) -> Tuple[List[Dict[str, Any]], str]:
+    """
+    Returns: (users, attributes_used)
+    Tenant-safe:
+      - If Concur returns 400 "Unrecognized attributes: X", remove X and retry.
+    """
     base = concur_base_url()
     url = f"{base}/profile/identity/v4.1/Users"
 
@@ -399,8 +424,11 @@ def _identity_list_users_paged(
     start_index = 1
     page = 0
 
+    attrs = attributes
+    fixes_used = 0
+
     while page < max_pages:
-        params = {"attributes": attributes, "startIndex": start_index, "count": count}
+        params = {"attributes": attrs, "startIndex": start_index, "count": count}
 
         try:
             resp = requests.get(
@@ -420,6 +448,16 @@ def _identity_list_users_paged(
             )
 
         if not resp.ok:
+            # Tenant-safe fix: remove unrecognized attribute and retry this same page
+            if resp.status_code == 400 and fixes_used < max_attr_fixes:
+                unrec = _extract_unrecognized_attribute_from_text(resp)
+                if unrec:
+                    new_attrs = _remove_attribute_from_list(attrs, unrec)
+                    if new_attrs != attrs and new_attrs.strip():
+                        attrs = new_attrs
+                        fixes_used += 1
+                        continue
+
             raise HTTPException(
                 status_code=502,
                 detail={
@@ -452,24 +490,31 @@ def _identity_list_users_paged(
         if len(resources) < count:
             break
 
-    return all_users
+    return all_users, attrs
 
 
 def list_users_tenant_safe(take: int) -> Tuple[List[Dict[str, Any]], str]:
+    """
+    Try with Concur extension first.
+    If Concur extension is rejected, fall back.
+    Also auto-removes any other unrecognized attribute (tenant-safe).
+    """
     try:
-        users = _identity_list_users_paged(
+        users, attrs_used = _identity_list_users_paged(
             attributes=ATTRS_WITH_CONCUR_EXT, count=200, max_pages=200
         )
-        return users[:take], "with_concur_extension"
+        return users[:take], f"with_concur_extension(attrs={attrs_used})"
     except HTTPException as he:
         detail = he.detail if isinstance(he.detail, dict) else {}
-        if detail.get("concur_status") == 400 and "Unrecognized attributes" in str(
-            detail.get("response", "")
+        # If Concur extension itself is rejected in some tenants, retry without it
+        if detail.get("concur_status") == 400 and (
+            "Unrecognized attributes" in str(detail.get("response", ""))
+            or "BAD_QUERY" in str(detail.get("response", ""))
         ):
-            users = _identity_list_users_paged(
+            users, attrs_used = _identity_list_users_paged(
                 attributes=ATTRS_NO_CONCUR_EXT, count=200, max_pages=200
             )
-            return users[:take], "no_concur_extension"
+            return users[:take], f"no_concur_extension(attrs={attrs_used})"
         raise
 
 
@@ -487,7 +532,7 @@ def get_user_detail_identity(user_id: str) -> Dict[str, Any]:
             )
 
             if resp.status_code == 400:
-                unrec = _extract_unrecognized_attribute(resp)
+                unrec = _extract_unrecognized_attribute_from_text(resp)
                 if unrec:
                     attrs2 = _remove_attribute_from_list(attrs, unrec)
                     if attrs2 == attrs:
@@ -676,7 +721,9 @@ def _fetch_list_item_by_href(href: str) -> Dict[str, Any]:
 
 
 def expand_list_items_from_spend(
-    spend_payload: Optional[Dict[str, Any]], *, limit: int = 50
+    spend_payload: Optional[Dict[str, Any]],
+    *,
+    limit: int = 50,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     items: Dict[str, Any] = {}
     errors: Dict[str, Any] = {}
@@ -890,11 +937,7 @@ def api_user_detail_full(
             "expand": expansions,
         },
         "userId": user_id,
-        "sources": {
-            "identity": identity,
-            "spend": spend,
-            "travel": travel,
-        },
+        "sources": {"identity": identity, "spend": spend, "travel": travel},
         "combined": combined,
         "expanded": expanded,
         "partialFailures": partial_failures,
