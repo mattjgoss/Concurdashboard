@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-# Your existing modules (already uploaded in the new app)
+# Existing project modules
 from auth.azure_ad import get_current_user, get_azure_ad_config_status
 from auth.concur_oauth import ConcurOAuthClient
 from services.identity_service import get_secret, keyvault_status
@@ -25,7 +25,9 @@ from services.excel_export import export_accruals_to_excel
 
 app = FastAPI(title="Concur Accruals API")
 
-BUILD_FINGERPRINT = os.getenv("SCM_COMMIT_ID") or os.getenv("WEBSITE_DEPLOYMENT_ID") or "unknown"
+BUILD_FINGERPRINT = (
+    os.getenv("SCM_COMMIT_ID") or os.getenv("WEBSITE_DEPLOYMENT_ID") or "unknown"
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
@@ -66,11 +68,8 @@ def concur_base_url() -> str:
 
 def api_app_id() -> str:
     """
-    Entra App ID (Application ID) for THIS FastAPI backend (the API resource).
-    Needed to generate user tokens via az CLI for Swagger testing.
-
-    Prefer env: API_APP_ID
-    Fallback Key Vault: 'api-app-id'
+    Entra App (Application) ID for THIS FastAPI backend (the API resource).
+    Used only to print token-generation commands for Swagger testing.
     """
     return (env("API_APP_ID") or kv("api-app-id") or "").strip()
 
@@ -103,7 +102,10 @@ def get_oauth_client() -> ConcurOAuthClient:
         missing.append("concur-refresh-token / CONCUR_REFRESH_TOKEN")
 
     if missing:
-        raise HTTPException(status_code=500, detail={"error": "missing_concur_oauth_config", "missing": missing})
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "missing_concur_oauth_config", "missing": missing},
+        )
 
     _oauth_client = ConcurOAuthClient(
         token_url=token_url,
@@ -213,11 +215,17 @@ def api_concur_auth_test():
     base = concur_base_url()
     url = f"{base}/profile/identity/v4.1/Users"
     try:
-        resp = requests.get(url, headers=concur_headers(), params={"count": 1}, timeout=30)
+        resp = requests.get(
+            url, headers=concur_headers(), params={"count": 1}, timeout=30
+        )
     except Exception as ex:
         raise HTTPException(
             status_code=502,
-            detail={"where": "concur_auth_test", "error": "request_failed", "message": str(ex)},
+            detail={
+                "where": "concur_auth_test",
+                "error": "request_failed",
+                "message": str(ex),
+            },
         )
 
     if not resp.ok:
@@ -234,39 +242,54 @@ def api_concur_auth_test():
         )
 
     payload = resp.json() if resp.content else {}
-    return {"ok": True, "status_code": resp.status_code, "base_url": base, "sample": (payload.get("Resources") or [])[:1]}
+    return {
+        "ok": True,
+        "status_code": resp.status_code,
+        "base_url": base,
+        "sample": (payload.get("Resources") or [])[:1],
+    }
 
 
 # ======================================================
 # NEW: Swagger helper endpoints (SAFE)
 # ======================================================
 
+
 @app.get("/api/tools/token-command")
 def token_command():
     """
     Returns COPY/PASTE commands to obtain an Entra user bearer token for this API.
-    IMPORTANT: This endpoint does NOT return a token value.
+    IMPORTANT:
+      - This endpoint NEVER returns a token value
+      - You must run the commands in Cloud Shell / terminal
+      - Then paste: Bearer <FULL TOKEN> into Swagger Authorize
     """
-    app_id = api_app_id() or "648a2fa4-dc6d-429c-8c50-ce51f48beb24"  # fallback to your known App ID
+    app_id = api_app_id() or "648a2fa4-dc6d-429c-8c50-ce51f48beb24"
     host = env("WEBSITE_HOSTNAME") or env("APP_HOSTNAME") or ""
     base = f"https://{host}".rstrip("/") if host else ""
 
+    # NOTE: no leading '#' comment lines to avoid confusion when copying out of Swagger
+    bash_block = f"""API_APP_ID="{app_id}"
+TOKEN=$(az account get-access-token --scope "api://$API_APP_ID/.default" --query accessToken -o tsv)
+echo "$TOKEN"
+echo "Swagger: {base}/docs"
+"""
+
+    powershell_block = f"""$API_APP_ID = "{app_id}"
+$TOKEN = az account get-access-token --scope "api://$API_APP_ID/.default" --query accessToken -o tsv
+$TOKEN
+Write-Host "Swagger: {base}/docs"
+"""
+
     return {
-        "note": "Run these commands in Azure Cloud Shell or a local terminal. Do NOT paste the token into chat/Yammer. Paste into Swagger Authorize as: Bearer <token>.",
-        "apiAppId": app_id,
-        "swaggerUrl": f"{base}/docs" if base else "/docs",
-        "cloudShell_bash": [
-            f'API_APP_ID="{app_id}"',
-            'TOKEN=$(az account get-access-token --resource "api://$API_APP_ID" --query accessToken -o tsv)',
-            'echo "${TOKEN:0:30}..."',
-            'echo "Paste into Swagger Authorize as: Bearer $TOKEN"',
+        "purpose": "Generate a FULL Entra bearer token for Swagger (/docs) testing",
+        "important": [
+            "This API will NEVER return a token value",
+            "Run the commands below in Cloud Shell or a local terminal",
+            "Paste into Swagger Authorize as: Bearer <FULL TOKEN>",
         ],
-        "powershell": [
-            f'$API_APP_ID="{app_id}"',
-            '$TOKEN = az account get-access-token --resource "api://$API_APP_ID" --query accessToken -o tsv',
-            '$TOKEN.Substring(0,30) + "..."',
-            'Write-Host "Paste into Swagger Authorize as: Bearer $TOKEN"',
-        ],
+        "bash": bash_block,
+        "powershell": powershell_block,
     }
 
 
@@ -280,10 +303,11 @@ def swagger_howto():
     return {
         "swaggerUrl": f"{base}/docs" if base else "/docs",
         "steps": [
-            "1) Get a bearer token using /api/tools/token-command (copy/paste the bash or PowerShell commands into Cloud Shell or your terminal).",
-            "2) Open /docs and click Authorize (top right).",
-            "3) Paste: Bearer <token> (include the word Bearer). Click Authorize then Close.",
-            "4) Now you can Try it out + Execute on any secured endpoint (/api/whoami, /api/users, /api/users/{id}/full, etc).",
+            "Run GET /api/tools/token-command and copy the bash (or powershell) block into Cloud Shell / terminal.",
+            "Copy the FULL printed token output.",
+            "Open /docs and click Authorize (top right).",
+            "Paste: Bearer <FULL_TOKEN> (include the word Bearer). Click Authorize then Close.",
+            "Now you can Try it out + Execute on any secured endpoint (/api/whoami, /api/users, /api/users/{id}/full, etc).",
         ],
         "security_note": "Swagger UI cannot mint tokens. Tokens must come from Entra (az CLI, MSAL, etc.). The API should not expose an endpoint that returns tokens.",
     }
@@ -292,6 +316,7 @@ def swagger_howto():
 # ======================================================
 # MODELS (kept minimal for now)
 # ======================================================
+
 
 class UnassignedCardsRequest(BaseModel):
     transactionDateFrom: str
@@ -327,7 +352,9 @@ def _extract_primary_email(user: Dict[str, Any]) -> Optional[str]:
 
 
 def _to_grid_row_identity(u: Dict[str, Any]) -> Dict[str, Any]:
-    enterprise = u.get("urn:ietf:params:scim:schemas:extension:enterprise:2.0:User") or {}
+    enterprise = (
+        u.get("urn:ietf:params:scim:schemas:extension:enterprise:2.0:User") or {}
+    )
     if not isinstance(enterprise, dict):
         enterprise = {}
 
@@ -362,7 +389,9 @@ def _remove_attribute_from_list(attr_string: str, attr_to_remove: str) -> str:
     return ",".join(parts)
 
 
-def _identity_list_users_paged(*, attributes: str, count: int = 200, max_pages: int = 200) -> List[Dict[str, Any]]:
+def _identity_list_users_paged(
+    *, attributes: str, count: int = 200, max_pages: int = 200
+) -> List[Dict[str, Any]]:
     base = concur_base_url()
     url = f"{base}/profile/identity/v4.1/Users"
 
@@ -374,7 +403,9 @@ def _identity_list_users_paged(*, attributes: str, count: int = 200, max_pages: 
         params = {"attributes": attributes, "startIndex": start_index, "count": count}
 
         try:
-            resp = requests.get(url, headers=concur_headers(), params=params, timeout=30)
+            resp = requests.get(
+                url, headers=concur_headers(), params=params, timeout=30
+            )
         except Exception as ex:
             raise HTTPException(
                 status_code=502,
@@ -426,12 +457,18 @@ def _identity_list_users_paged(*, attributes: str, count: int = 200, max_pages: 
 
 def list_users_tenant_safe(take: int) -> Tuple[List[Dict[str, Any]], str]:
     try:
-        users = _identity_list_users_paged(attributes=ATTRS_WITH_CONCUR_EXT, count=200, max_pages=200)
+        users = _identity_list_users_paged(
+            attributes=ATTRS_WITH_CONCUR_EXT, count=200, max_pages=200
+        )
         return users[:take], "with_concur_extension"
     except HTTPException as he:
         detail = he.detail if isinstance(he.detail, dict) else {}
-        if detail.get("concur_status") == 400 and "Unrecognized attributes" in str(detail.get("response", "")):
-            users = _identity_list_users_paged(attributes=ATTRS_NO_CONCUR_EXT, count=200, max_pages=200)
+        if detail.get("concur_status") == 400 and "Unrecognized attributes" in str(
+            detail.get("response", "")
+        ):
+            users = _identity_list_users_paged(
+                attributes=ATTRS_NO_CONCUR_EXT, count=200, max_pages=200
+            )
             return users[:take], "no_concur_extension"
         raise
 
@@ -445,7 +482,9 @@ def get_user_detail_identity(user_id: str) -> Dict[str, Any]:
 
     try:
         for _ in range(6):
-            resp = requests.get(url, headers=concur_headers(), params={"attributes": attrs}, timeout=30)
+            resp = requests.get(
+                url, headers=concur_headers(), params={"attributes": attrs}, timeout=30
+            )
 
             if resp.status_code == 400:
                 unrec = _extract_unrecognized_attribute(resp)
@@ -456,7 +495,11 @@ def get_user_detail_identity(user_id: str) -> Dict[str, Any]:
                     attrs = attrs2
                     continue
 
-                if "Unrecognized attributes" in (resp.text or "") and "urn:ietf:params:scim:schemas:extension:concur:2.0:User" in attrs:
+                if (
+                    "Unrecognized attributes" in (resp.text or "")
+                    and "urn:ietf:params:scim:schemas:extension:concur:2.0:User"
+                    in attrs
+                ):
                     attrs = ATTRS_NO_CONCUR_EXT
                     continue
 
@@ -465,7 +508,12 @@ def get_user_detail_identity(user_id: str) -> Dict[str, Any]:
     except Exception as ex:
         raise HTTPException(
             status_code=502,
-            detail={"where": "user_detail_identity", "error": "request_failed", "message": str(ex), "url": url},
+            detail={
+                "where": "user_detail_identity",
+                "error": "request_failed",
+                "message": str(ex),
+                "url": url,
+            },
         )
 
     if resp is None or not resp.ok:
@@ -489,6 +537,7 @@ def get_user_detail_identity(user_id: str) -> Dict[str, Any]:
 # FULL PROFILE HELPERS (Identity + Spend + Travel + List expansion)
 # ======================================================
 
+
 def get_user_detail_spend(user_id: str) -> Dict[str, Any]:
     base = concur_base_url()
     url = f"{base}/profile/spend/v4.1/Users/{user_id}"
@@ -510,7 +559,9 @@ def _deep_merge(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
     return dst
 
 
-def _materialise_custom_fields_from_spend(spend_payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _materialise_custom_fields_from_spend(
+    spend_payload: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
     out: Dict[str, Any] = {"custom": {}, "orgUnits": {}}
     if not isinstance(spend_payload, dict):
         for i in range(1, 23):
@@ -553,7 +604,9 @@ def _parse_expand(expand: Optional[str]) -> List[str]:
     return [p.strip() for p in expand.split(",") if p.strip()]
 
 
-def _collect_list_item_refs_from_spend(spend_payload: Optional[Dict[str, Any]]) -> List[Dict[str, str]]:
+def _collect_list_item_refs_from_spend(
+    spend_payload: Optional[Dict[str, Any]],
+) -> List[Dict[str, str]]:
     refs: List[Dict[str, str]] = []
     if not isinstance(spend_payload, dict):
         return refs
@@ -579,7 +632,9 @@ def _collect_list_item_refs_from_spend(spend_payload: Optional[Dict[str, Any]]) 
             continue
 
         key = sync_guid or href
-        refs.append({"key": key, "href": href, "syncGuid": sync_guid, "fieldId": field_id})
+        refs.append(
+            {"key": key, "href": href, "syncGuid": sync_guid, "fieldId": field_id}
+        )
 
     seen = set()
     out: List[Dict[str, str]] = []
@@ -597,7 +652,12 @@ def _fetch_list_item_by_href(href: str) -> Dict[str, Any]:
     except Exception as ex:
         raise HTTPException(
             status_code=502,
-            detail={"where": "list_item_fetch", "error": "request_failed", "message": str(ex), "href": href},
+            detail={
+                "where": "list_item_fetch",
+                "error": "request_failed",
+                "message": str(ex),
+                "href": href,
+            },
         )
 
     if not resp.ok:
@@ -615,7 +675,9 @@ def _fetch_list_item_by_href(href: str) -> Dict[str, Any]:
     return resp.json() if resp.content else {}
 
 
-def expand_list_items_from_spend(spend_payload: Optional[Dict[str, Any]], *, limit: int = 50) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def expand_list_items_from_spend(
+    spend_payload: Optional[Dict[str, Any]], *, limit: int = 50
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     items: Dict[str, Any] = {}
     errors: Dict[str, Any] = {}
 
@@ -661,7 +723,9 @@ def _summarise_list_item(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def build_resolved_from_expanded_list_items(items_by_key: Dict[str, Any]) -> Dict[str, Any]:
+def build_resolved_from_expanded_list_items(
+    items_by_key: Dict[str, Any],
+) -> Dict[str, Any]:
     resolved = {"orgUnits": {}, "custom": {}}
     if not isinstance(items_by_key, dict):
         return resolved
@@ -694,6 +758,7 @@ def build_resolved_from_expanded_list_items(items_by_key: Dict[str, Any]) -> Dic
 # ROUTES YOU NEED FOR SHAREPOINT (Users)
 # ======================================================
 
+
 @app.get("/api/users")
 def api_users_list(
     take: int = Query(500, ge=1, le=5000),
@@ -725,19 +790,29 @@ def api_user_detail(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     if not user_id or user_id.strip() == "":
-        raise HTTPException(status_code=400, detail={"error": "missing_user_id", "message": "user_id is required"})
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "missing_user_id", "message": "user_id is required"},
+        )
     return get_user_detail_identity(user_id)
 
 
 @app.get("/api/users/{user_id}/full")
 def api_user_detail_full(
     user_id: str,
-    expand: Optional[str] = Query(None, description="Optional expansions, e.g. 'listItems'"),
-    expandLimit: int = Query(50, ge=0, le=200, description="Max list items to expand (safety cap)"),
+    expand: Optional[str] = Query(
+        None, description="Optional expansions, e.g. 'listItems'"
+    ),
+    expandLimit: int = Query(
+        50, ge=0, le=200, description="Max list items to expand (safety cap)"
+    ),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     if not user_id or user_id.strip() == "":
-        raise HTTPException(status_code=400, detail={"error": "missing_user_id", "message": "user_id is required"})
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "missing_user_id", "message": "user_id is required"},
+        )
 
     requested_by = (
         current_user.get("upn")
@@ -775,7 +850,9 @@ def api_user_detail_full(
         "spend": spend.get("meta") if isinstance(spend, dict) else None,
         "travel": travel.get("meta") if isinstance(travel, dict) else None,
     }
-    combined["_derived"] = _materialise_custom_fields_from_spend(spend if isinstance(spend, dict) else None)
+    combined["_derived"] = _materialise_custom_fields_from_spend(
+        spend if isinstance(spend, dict) else None
+    )
 
     expanded: Dict[str, Any] = {}
     expansions = _parse_expand(expand)
@@ -791,11 +868,18 @@ def api_user_detail_full(
                 "errors": len(errors),
                 "limit": expandLimit,
             }
-            combined["_derived"]["resolved"] = build_resolved_from_expanded_list_items(items)
+            combined["_derived"]["resolved"] = build_resolved_from_expanded_list_items(
+                items
+            )
         else:
             expanded["listItems"] = {}
             expanded["listItemsErrors"] = {}
-            expanded["listItemsMeta"] = {"requested": 0, "expanded": 0, "errors": 0, "limit": expandLimit}
+            expanded["listItemsMeta"] = {
+                "requested": 0,
+                "expanded": 0,
+                "errors": 0,
+                "limit": expandLimit,
+            }
             combined["_derived"]["resolved"] = {"orgUnits": {}, "custom": {}}
 
     return {
@@ -820,6 +904,7 @@ def api_user_detail_full(
 # ======================================================
 # OPTIONAL: KEEP EXCEL EXPORT HOOKS (no change)
 # ======================================================
+
 
 @app.get("/api/users/export")
 def api_users_export(
