@@ -21,8 +21,9 @@ jobs:
         run: |
           test -f main.py
           test -f requirements.txt
-          test -d services
           test -d auth
+          test -d services
+          test -d models
           echo "Repo structure looks OK."
 
       - name: Set up Python 3.11
@@ -37,15 +38,15 @@ jobs:
           python -m pip install -r requirements.txt --target ".python_packages/lib/site-packages"
           python -c "import uvicorn, fastapi; print('uvicorn', uvicorn.__version__, 'fastapi', fastapi.__version__)"
 
-      - name: Create deployment ZIP (includes .python_packages)
+      - name: Create deployment ZIP (no top-level folder)
         run: |
           rm -f "${ZIP_NAME}"
           zip -r "${ZIP_NAME}" \
             main.py requirements.txt \
-            services auth reports exports logic models \
+            auth services models logic \
             .python_packages \
-            -x "**/__pycache__/*" "*.pyc" ".git/*" ".github/*"
-          echo "ZIP content check:"
+            -x "**/__pycache__/*" "*.pyc" ".git/*" ".github/*" "documentation/*" "exports/*"
+          echo "ZIP content check (top 80):"
           unzip -l "${ZIP_NAME}" | head -n 80
           echo "Confirm uvicorn packaged:"
           unzip -l "${ZIP_NAME}" | grep -i "uvicorn" | head -n 20
