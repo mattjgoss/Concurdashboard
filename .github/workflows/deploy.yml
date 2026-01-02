@@ -12,7 +12,6 @@ env:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,6 +20,7 @@ jobs:
         run: |
           test -f main.py
           test -f requirements.txt
+          test -f startup.sh
           test -d services
           test -d auth
           echo "Repo structure looks OK."
@@ -29,13 +29,11 @@ jobs:
         run: |
           rm -f "${ZIP_NAME}"
           zip -r "${ZIP_NAME}" \
-            main.py requirements.txt \
+            main.py requirements.txt startup.sh \
             services auth reports exports logic models \
             -x "**/__pycache__/*" "*.pyc" ".git/*" ".github/*"
-          echo "ZIP content (top 50 lines):"
-          unzip -l "${ZIP_NAME}" | head -n 50
-          echo "Confirm folders present:"
-          unzip -l "${ZIP_NAME}" | grep -E "^(.*\s)?(services/|auth/|reports/)" | head -n 20
+          echo "ZIP content (top 60 lines):"
+          unzip -l "${ZIP_NAME}" | head -n 60
 
       - name: Deploy to Azure Web App (zip)
         uses: azure/webapps-deploy@v3
