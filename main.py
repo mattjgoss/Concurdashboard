@@ -109,7 +109,12 @@ def concur_headers() -> Dict[str, str]:
     return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
 
-def _concur_get_json(url: str, *, params: Optional[Dict[str, Any]] = None, where: str = "concur_get") -> Dict[str, Any]:
+def _concur_get_json(
+    url: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    where: str = "concur_get",
+) -> Dict[str, Any]:
     """
     Shared Concur GET helper that raises a structured HTTPException on failure.
     """
@@ -236,7 +241,7 @@ class UnassignedCardsRequest(BaseModel):
 # ======================================================
 
 # "Wide" identity attributes we *try* to request.
-# IMPORTANT: different Concur tenants reject different attributes. We now auto-remove any
+# IMPORTANT: different Concur tenants reject different attributes. We auto-remove any
 # "Unrecognized attributes: X" and retry.
 ATTRS_WITH_CONCUR_EXT = (
     "id,userName,displayName,active,"
@@ -289,7 +294,6 @@ def _extract_unrecognized_attribute(resp: requests.Response) -> Optional[str]:
     marker = "Unrecognized attributes:"
     if marker not in detail:
         return None
-    # e.g. "Unrecognized attributes: groups" or "Unrecognized attributes: a,b"
     tail = detail.split(marker, 1)[1].strip()
     if not tail:
         return None
@@ -378,8 +382,6 @@ def list_users_tenant_safe(take: int) -> Tuple[List[Dict[str, Any]], str]:
         return users[:take], "with_concur_extension"
     except HTTPException as he:
         detail = he.detail if isinstance(he.detail, dict) else {}
-        # If the tenant rejects *any* specific attribute list in list endpoint, fallback to no concur extension.
-        # (List endpoint is already proven working in your tenant with your prior attributeMode logic.)
         if detail.get("concur_status") == 400 and "Unrecognized attributes" in str(detail.get("response", "")):
             users = _identity_list_users_paged(attributes=ATTRS_NO_CONCUR_EXT, count=200, max_pages=200)
             return users[:take], "no_concur_extension"
@@ -398,28 +400,23 @@ def get_user_detail_identity(user_id: str) -> Dict[str, Any]:
     resp: Optional[requests.Response] = None
 
     try:
-        # Retry a few times removing any rejected attributes
         for _ in range(6):
             resp = requests.get(url, headers=concur_headers(), params={"attributes": attrs}, timeout=30)
 
             if resp.status_code == 400:
                 unrec = _extract_unrecognized_attribute(resp)
                 if unrec:
-                    # remove the rejected attribute and retry
                     attrs2 = _remove_attribute_from_list(attrs, unrec)
-                    # if nothing changed, stop looping to avoid infinite retries
                     if attrs2 == attrs:
                         break
                     attrs = attrs2
                     continue
 
-                # If it's rejecting the Concur extension URN, fall back to the safe list
-                # (some tenants reject the Concur extension entirely).
+                # Some tenants reject the Concur extension URN entirely
                 if "Unrecognized attributes" in (resp.text or "") and "urn:ietf:params:scim:schemas:extension:concur:2.0:User" in attrs:
                     attrs = ATTRS_NO_CONCUR_EXT
                     continue
 
-            # success or a non-400 error => exit loop
             break
 
     except Exception as ex:
@@ -492,14 +489,12 @@ def _materialise_custom_fields_from_spend(spend_payload: Optional[Dict[str, Any]
     """
     out: Dict[str, Any] = {"custom": {}, "orgUnits": {}}
     if not isinstance(spend_payload, dict):
-        # still return full key set for UI consistency
         for i in range(1, 23):
             out["custom"][f"custom{i}"] = None
         for i in range(1, 7):
             out["orgUnits"][f"orgUnit{i}"] = None
         return out
 
-    # customData might be at top-level, or inside a schema urn dict; search for it.
     custom_data = spend_payload.get("customData")
     if not isinstance(custom_data, list):
         for v in spend_payload.values():
@@ -520,13 +515,126 @@ def _materialise_custom_fields_from_spend(spend_payload: Optional[Dict[str, Any]
             elif cid.startswith("orgUnit"):
                 out["orgUnits"][cid] = val
 
-    # Ensure all expected keys exist (custom1..custom22, orgUnit1..orgUnit6)
     for i in range(1, 23):
         out["custom"].setdefault(f"custom{i}", None)
     for i in range(1, 7):
         out["orgUnits"].setdefault(f"orgUnit{i}", None)
 
     return out
+
+
+def _parse_expand(expand: Optional[str]) -> List[str]:
+    """
+    expand can be:
+      - None
+      - "listItems"
+      - "listItems,otherThing"
+    """
+    if not expand:
+        return []
+    parts = [p.strip() for p in expand.split(",") if p.strip()]
+    return parts
+
+
+def _collect_list_item_refs_from_spend(spend_payload: Optional[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """
+    Returns a list of refs like:
+      {"key": "<syncGuid or href>", "href": "<url>", "syncGuid": "<guid or ''>", "fieldId": "<custom/org id>"}
+    """
+    refs: List[Dict[str, str]] = []
+    if not isinstance(spend_payload, dict):
+        return refs
+
+    # Locate customData
+    custom_data = spend_payload.get("customData")
+    if not isinstance(custom_data, list):
+        for v in spend_payload.values():
+            if isinstance(v, dict) and isinstance(v.get("customData"), list):
+                custom_data = v.get("customData")
+                break
+
+    if not isinstance(custom_data, list):
+        return refs
+
+    for item in custom_data:
+        if not isinstance(item, dict):
+            continue
+        href = str(item.get("href") or "").strip()
+        sync_guid = str(item.get("syncGuid") or "").strip()
+        field_id = str(item.get("id") or "").strip()
+
+        if not href:
+            continue
+
+        key = sync_guid or href
+        refs.append({"key": key, "href": href, "syncGuid": sync_guid, "fieldId": field_id})
+
+    # de-dupe by key
+    seen = set()
+    out: List[Dict[str, str]] = []
+    for r in refs:
+        if r["key"] in seen:
+            continue
+        seen.add(r["key"])
+        out.append(r)
+    return out
+
+
+def _fetch_list_item_by_href(href: str) -> Dict[str, Any]:
+    """
+    Fetches a Concur List v4 item via its full href URL.
+    Uses the same Concur service token (refresh flow).
+    """
+    try:
+        resp = requests.get(href, headers=concur_headers(), timeout=30)
+    except Exception as ex:
+        raise HTTPException(
+            status_code=502,
+            detail={"where": "list_item_fetch", "error": "request_failed", "message": str(ex), "href": href},
+        )
+
+    if not resp.ok:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "where": "list_item_fetch",
+                "error": "concur_error",
+                "concur_status": resp.status_code,
+                "href": href,
+                "response": (resp.text or "")[:2000],
+            },
+        )
+
+    return resp.json() if resp.content else {}
+
+
+def expand_list_items_from_spend(spend_payload: Optional[Dict[str, Any]], *, limit: int = 50) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Expands Spend customData hrefs into actual List item payloads.
+    Returns: (items_by_key, errors_by_key)
+    """
+    items: Dict[str, Any] = {}
+    errors: Dict[str, Any] = {}
+
+    refs = _collect_list_item_refs_from_spend(spend_payload)
+    if not refs:
+        return items, errors
+
+    refs = refs[: max(0, int(limit))]
+
+    for r in refs:
+        key = r["key"]
+        href = r["href"]
+        try:
+            payload = _fetch_list_item_by_href(href)
+            items[key] = {
+                "ref": r,
+                "item": payload,
+            }
+        except HTTPException as he:
+            errors[key] = {"ref": r, "error": he.detail}
+
+    return items, errors
 
 
 # ======================================================
@@ -571,6 +679,8 @@ def api_user_detail(
 @app.get("/api/users/{user_id}/full")
 def api_user_detail_full(
     user_id: str,
+    expand: Optional[str] = Query(None, description="Optional expansions, e.g. 'listItems' or 'listItems,other'"),
+    expandLimit: int = Query(50, ge=0, le=200, description="Max list items to expand (safety cap)"),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """
@@ -579,7 +689,8 @@ def api_user_detail_full(
       - Spend v4.1 user (includes customData: custom1..custom22, orgUnit1..orgUnit6, plus spend extensions)
       - Travel v4 user (travel extension data)
 
-    Does not fail the whole response if Spend or Travel is unavailable; surfaces partialFailures.
+    Optional:
+      - expand=listItems: expands customData hrefs to List v4 item payloads
     """
     if not user_id or user_id.strip() == "":
         raise HTTPException(status_code=400, detail={"error": "missing_user_id", "message": "user_id is required"})
@@ -627,11 +738,31 @@ def api_user_detail_full(
     }
     combined["_derived"] = _materialise_custom_fields_from_spend(spend if isinstance(spend, dict) else None)
 
+    expanded: Dict[str, Any] = {}
+
+    expansions = _parse_expand(expand)
+    if "listItems" in expansions:
+        if isinstance(spend, dict):
+            items, errors = expand_list_items_from_spend(spend, limit=expandLimit)
+            expanded["listItems"] = items
+            expanded["listItemsErrors"] = errors
+            expanded["listItemsMeta"] = {
+                "requested": len(_collect_list_item_refs_from_spend(spend)),
+                "expanded": len(items),
+                "errors": len(errors),
+                "limit": expandLimit,
+            }
+        else:
+            expanded["listItems"] = {}
+            expanded["listItemsErrors"] = {}
+            expanded["listItemsMeta"] = {"requested": 0, "expanded": 0, "errors": 0, "limit": expandLimit}
+
     return {
         "meta": {
             "requestedBy": requested_by,
             "concurBaseUrl": concur_base_url(),
             "hasPartialFailures": bool(partial_failures),
+            "expand": expansions,
         },
         "userId": user_id,
         "sources": {
@@ -640,6 +771,7 @@ def api_user_detail_full(
             "travel": travel,
         },
         "combined": combined,
+        "expanded": expanded,
         "partialFailures": partial_failures,
     }
 
