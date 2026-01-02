@@ -12,6 +12,7 @@ env:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,7 +21,6 @@ jobs:
         run: |
           test -f main.py
           test -f requirements.txt
-          test -f startup.sh
           test -d services
           test -d auth
           echo "Repo structure looks OK."
@@ -28,12 +28,18 @@ jobs:
       - name: Create Linux-safe deployment ZIP (no top-level folder)
         run: |
           rm -f "${ZIP_NAME}"
-          zip -r "${ZIP_NAME}" \
-            main.py requirements.txt startup.sh \
-            services auth reports exports logic models \
+
+          # Only include folders that exist (avoids breaking the workflow)
+          INCLUDE_DIRS=""
+          for d in services auth models logic reports exports; do
+            if [ -d "$d" ]; then INCLUDE_DIRS="$INCLUDE_DIRS $d"; fi
+          done
+
+          zip -r "${ZIP_NAME}" main.py requirements.txt $INCLUDE_DIRS \
             -x "**/__pycache__/*" "*.pyc" ".git/*" ".github/*"
-          echo "ZIP content (top 60 lines):"
-          unzip -l "${ZIP_NAME}" | head -n 60
+
+          echo "ZIP content (top 80 lines):"
+          unzip -l "${ZIP_NAME}" | head -n 80
 
       - name: Deploy to Azure Web App (zip)
         uses: azure/webapps-deploy@v3
