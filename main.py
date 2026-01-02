@@ -518,64 +518,7 @@ def list_users_tenant_safe(take: int) -> Tuple[List[Dict[str, Any]], str]:
         raise
 
 
-def get_user_detail_identity(user_id: str) -> Dict[str, Any]:
-    base = concur_base_url()
-    url = f"{base}/profile/identity/v4.1/Users/{user_id}"
-
-    attrs = ATTRS_WITH_CONCUR_EXT
-    resp: Optional[requests.Response] = None
-
-    try:
-        for _ in range(6):
-            resp = requests.get(
-                url, headers=concur_headers(), params={"attributes": attrs}, timeout=30
-            )
-
-            if resp.status_code == 400:
-                unrec = _extract_unrecognized_attribute_from_text(resp)
-                if unrec:
-                    attrs2 = _remove_attribute_from_list(attrs, unrec)
-                    if attrs2 == attrs:
-                        break
-                    attrs = attrs2
-                    continue
-
-                if (
-                    "Unrecognized attributes" in (resp.text or "")
-                    and "urn:ietf:params:scim:schemas:extension:concur:2.0:User"
-                    in attrs
-                ):
-                    attrs = ATTRS_NO_CONCUR_EXT
-                    continue
-
-            break
-
-    except Exception as ex:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "where": "user_detail_identity",
-                "error": "request_failed",
-                "message": str(ex),
-                "url": url,
-            },
-        )
-
-    if resp is None or not resp.ok:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "where": "user_detail_identity",
-                "error": "concur_error",
-                "concur_status": (resp.status_code if resp is not None else None),
-                "url": url,
-                "base_url": base,
-                "response": ((resp.text or "")[:2000] if resp is not None else ""),
-                "attributes_used": attrs,
-            },
-        )
-
-    return resp.json() or {}
+def get_user_detail_identity(user_id: str)
 
 
 # ======================================================
