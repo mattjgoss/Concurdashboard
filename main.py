@@ -15,7 +15,7 @@ from pydantic import BaseModel
 # Existing project modules (must exist in your repo/package)
 from auth.azure_ad import get_current_user, get_azure_ad_config_status
 from auth.concur_oauth import ConcurOAuthClient
-from services.keyvault_service import get_secret
+from services.identity_service import get_secret
 
 # ======================================================
 # ENV + KEY VAULT HELPERS
