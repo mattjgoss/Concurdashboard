@@ -109,6 +109,41 @@ def concur_headers() -> Dict[str, str]:
     return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
 
+def _concur_get_json(url: str, *, params: Optional[Dict[str, Any]] = None, where: str = "concur_get") -> Dict[str, Any]:
+    """
+    Shared Concur GET helper that raises a structured HTTPException on failure.
+    """
+    try:
+        resp = requests.get(url, headers=concur_headers(), params=params, timeout=30)
+    except Exception as ex:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "where": where,
+                "error": "request_failed",
+                "message": str(ex),
+                "url": url,
+                "params": params or {},
+            },
+        )
+
+    if not resp.ok:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "where": where,
+                "error": "concur_error",
+                "concur_status": resp.status_code,
+                "url": url,
+                "params": params or {},
+                "base_url": concur_base_url(),
+                "response": (resp.text or "")[:2000],
+            },
+        )
+
+    return resp.json() if resp.content else {}
+
+
 # ======================================================
 # CORS
 # ======================================================
@@ -183,12 +218,7 @@ def api_concur_auth_test():
         )
 
     payload = resp.json() if resp.content else {}
-    return {
-        "ok": True,
-        "status_code": resp.status_code,
-        "base_url": base,
-        "sample": (payload.get("Resources") or [])[:1],
-    }
+    return {"ok": True, "status_code": resp.status_code, "base_url": base, "sample": (payload.get("Resources") or [])[:1]}
 
 
 # ======================================================
@@ -205,6 +235,9 @@ class UnassignedCardsRequest(BaseModel):
 # IDENTITY HELPERS (tenant-safe attributes fallback)
 # ======================================================
 
+# "Wide" identity attributes we *try* to request.
+# IMPORTANT: different Concur tenants reject different attributes. We now auto-remove any
+# "Unrecognized attributes: X" and retry.
 ATTRS_WITH_CONCUR_EXT = (
     "id,userName,displayName,active,"
     "name,emails,phoneNumbers,addresses,timezone,locale,preferredLanguage,groups,meta,"
@@ -217,17 +250,6 @@ ATTRS_NO_CONCUR_EXT = (
     "name,emails,phoneNumbers,addresses,timezone,locale,preferredLanguage,groups,meta,"
     "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"
 )
-
-
-def _is_unrecognized_attributes_400(resp: requests.Response) -> bool:
-    if resp.status_code != 400:
-        return False
-    try:
-        j = resp.json()
-        detail = (j or {}).get("detail") or ""
-        return "Unrecognized attributes" in str(detail)
-    except Exception:
-        return False
 
 
 def _extract_primary_email(user: Dict[str, Any]) -> Optional[str]:
@@ -244,7 +266,6 @@ def _to_grid_row_identity(u: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(enterprise, dict):
         enterprise = {}
 
-    # Note: Concur extension may not exist in this tenant; don’t depend on it.
     return {
         "id": u.get("id"),
         "displayName": u.get("displayName"),
@@ -255,15 +276,35 @@ def _to_grid_row_identity(u: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _identity_list_users_paged(
-    *,
-    attributes: str,
-    count: int = 200,
-    max_pages: int = 200,
-) -> List[Dict[str, Any]]:
+def _extract_unrecognized_attribute(resp: requests.Response) -> Optional[str]:
+    """
+    If Concur returns detail: "Unrecognized attributes: groups", return "groups".
+    Works for any single attribute name Concur reports.
+    """
+    try:
+        j = resp.json() or {}
+        detail = str(j.get("detail") or "")
+    except Exception:
+        detail = ""
+    marker = "Unrecognized attributes:"
+    if marker not in detail:
+        return None
+    # e.g. "Unrecognized attributes: groups" or "Unrecognized attributes: a,b"
+    tail = detail.split(marker, 1)[1].strip()
+    if not tail:
+        return None
+    return tail.split(",")[0].strip()
+
+
+def _remove_attribute_from_list(attr_string: str, attr_to_remove: str) -> str:
+    parts = [p.strip() for p in attr_string.split(",") if p.strip()]
+    parts = [p for p in parts if p != attr_to_remove]
+    return ",".join(parts)
+
+
+def _identity_list_users_paged(*, attributes: str, count: int = 200, max_pages: int = 200) -> List[Dict[str, Any]]:
     """
     Lists Identity v4.1 Users with paging.
-    Raises a useful error payload if Concur returns an error.
     """
     base = concur_base_url()
     url = f"{base}/profile/identity/v4.1/Users"
@@ -336,8 +377,9 @@ def list_users_tenant_safe(take: int) -> Tuple[List[Dict[str, Any]], str]:
         users = _identity_list_users_paged(attributes=ATTRS_WITH_CONCUR_EXT, count=200, max_pages=200)
         return users[:take], "with_concur_extension"
     except HTTPException as he:
-        # If the tenant rejects the Concur extension, retry without it.
         detail = he.detail if isinstance(he.detail, dict) else {}
+        # If the tenant rejects *any* specific attribute list in list endpoint, fallback to no concur extension.
+        # (List endpoint is already proven working in your tenant with your prior attributeMode logic.)
         if detail.get("concur_status") == 400 and "Unrecognized attributes" in str(detail.get("response", "")):
             users = _identity_list_users_paged(attributes=ATTRS_NO_CONCUR_EXT, count=200, max_pages=200)
             return users[:take], "no_concur_extension"
@@ -347,32 +389,56 @@ def list_users_tenant_safe(take: int) -> Tuple[List[Dict[str, Any]], str]:
 def get_user_detail_identity(user_id: str) -> Dict[str, Any]:
     """
     Fetch SCIM record for a userId from Identity v4.1.
-    Attempts to explicitly request the widest common attribute set; falls back if tenant rejects.
+    Robust against tenant-specific 'Unrecognized attributes: X' errors (e.g., groups).
     """
     base = concur_base_url()
     url = f"{base}/profile/identity/v4.1/Users/{user_id}"
 
-    # Try requesting broad attributes first; if tenant rejects concur extension, fall back.
+    attrs = ATTRS_WITH_CONCUR_EXT
+    resp: Optional[requests.Response] = None
+
     try:
-        resp = requests.get(url, headers=concur_headers(), params={"attributes": ATTRS_WITH_CONCUR_EXT}, timeout=30)
-        if _is_unrecognized_attributes_400(resp):
-            resp = requests.get(url, headers=concur_headers(), params={"attributes": ATTRS_NO_CONCUR_EXT}, timeout=30)
+        # Retry a few times removing any rejected attributes
+        for _ in range(6):
+            resp = requests.get(url, headers=concur_headers(), params={"attributes": attrs}, timeout=30)
+
+            if resp.status_code == 400:
+                unrec = _extract_unrecognized_attribute(resp)
+                if unrec:
+                    # remove the rejected attribute and retry
+                    attrs2 = _remove_attribute_from_list(attrs, unrec)
+                    # if nothing changed, stop looping to avoid infinite retries
+                    if attrs2 == attrs:
+                        break
+                    attrs = attrs2
+                    continue
+
+                # If it's rejecting the Concur extension URN, fall back to the safe list
+                # (some tenants reject the Concur extension entirely).
+                if "Unrecognized attributes" in (resp.text or "") and "urn:ietf:params:scim:schemas:extension:concur:2.0:User" in attrs:
+                    attrs = ATTRS_NO_CONCUR_EXT
+                    continue
+
+            # success or a non-400 error => exit loop
+            break
+
     except Exception as ex:
         raise HTTPException(
             status_code=502,
             detail={"where": "user_detail_identity", "error": "request_failed", "message": str(ex), "url": url},
         )
 
-    if not resp.ok:
+    if resp is None or not resp.ok:
         raise HTTPException(
             status_code=502,
             detail={
                 "where": "user_detail_identity",
                 "error": "concur_error",
-                "concur_status": resp.status_code,
+                "concur_status": (resp.status_code if resp is not None else None),
                 "url": url,
                 "base_url": base,
-                "response": (resp.text or "")[:2000],
+                "response": ((resp.text or "")[:2000] if resp is not None else ""),
+                "attributes_used": attrs,
             },
         )
 
@@ -383,42 +449,10 @@ def get_user_detail_identity(user_id: str) -> Dict[str, Any]:
 # FULL PROFILE HELPERS (Identity + Spend + Travel)
 # ======================================================
 
-def _concur_get_json(url: str, *, params: Optional[Dict[str, Any]] = None, where: str = "concur_get") -> Dict[str, Any]:
-    try:
-        resp = requests.get(url, headers=concur_headers(), params=params, timeout=30)
-    except Exception as ex:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "where": where,
-                "error": "request_failed",
-                "message": str(ex),
-                "url": url,
-                "params": params or {},
-            },
-        )
-
-    if not resp.ok:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "where": where,
-                "error": "concur_error",
-                "concur_status": resp.status_code,
-                "url": url,
-                "params": params or {},
-                "base_url": concur_base_url(),
-                "response": (resp.text or "")[:2000],
-            },
-        )
-
-    return resp.json() if resp.content else {}
-
-
 def get_user_detail_spend(user_id: str) -> Dict[str, Any]:
     """
     Spend user profile (includes customData[] where ids include:
-    custom1..custom22 and orgUnit1..orgUnit6, plus many other spend extensions).
+    custom1..custom22 and orgUnit1..orgUnit6, plus spend extensions).
     """
     base = concur_base_url()
     url = f"{base}/profile/spend/v4.1/Users/{user_id}"
@@ -456,41 +490,41 @@ def _materialise_custom_fields_from_spend(spend_payload: Optional[Dict[str, Any]
         "orgUnits": {"orgUnit1": "...", ..., "orgUnit6": "..."}
       }
     """
-    out = {"custom": {}, "orgUnits": {}}
+    out: Dict[str, Any] = {"custom": {}, "orgUnits": {}}
     if not isinstance(spend_payload, dict):
+        # still return full key set for UI consistency
+        for i in range(1, 23):
+            out["custom"][f"custom{i}"] = None
+        for i in range(1, 7):
+            out["orgUnits"][f"orgUnit{i}"] = None
         return out
 
-    # customData is typically under spend user extension schema; but to be robust, scan top-level.
+    # customData might be at top-level, or inside a schema urn dict; search for it.
     custom_data = spend_payload.get("customData")
     if not isinstance(custom_data, list):
-        # Sometimes it's nested under the Spend extension URN; scan for any dict containing customData.
         for v in spend_payload.values():
             if isinstance(v, dict) and isinstance(v.get("customData"), list):
                 custom_data = v.get("customData")
                 break
 
-    if not isinstance(custom_data, list):
-        return out
-
-    for item in custom_data:
-        if not isinstance(item, dict):
-            continue
-        cid = str(item.get("id") or "").strip()
-        val = item.get("value")
-        if not cid:
-            continue
-        if cid.startswith("custom"):
-            out["custom"][cid] = val
-        if cid.startswith("orgUnit"):
-            out["orgUnits"][cid] = val
+    if isinstance(custom_data, list):
+        for item in custom_data:
+            if not isinstance(item, dict):
+                continue
+            cid = str(item.get("id") or "").strip()
+            if not cid:
+                continue
+            val = item.get("value")
+            if cid.startswith("custom"):
+                out["custom"][cid] = val
+            elif cid.startswith("orgUnit"):
+                out["orgUnits"][cid] = val
 
     # Ensure all expected keys exist (custom1..custom22, orgUnit1..orgUnit6)
     for i in range(1, 23):
-        k = f"custom{i}"
-        out["custom"].setdefault(k, None)
+        out["custom"].setdefault(f"custom{i}", None)
     for i in range(1, 7):
-        k = f"orgUnit{i}"
-        out["orgUnits"].setdefault(k, None)
+        out["orgUnits"].setdefault(f"orgUnit{i}", None)
 
     return out
 
@@ -541,7 +575,7 @@ def api_user_detail_full(
 ):
     """
     Returns the maximum available employee profile data by aggregating:
-      - Identity v4.1 user (core + enterprise + optional concur ext)
+      - Identity v4.1 user (core + enterprise + optional concur ext; auto-removes invalid attrs)
       - Spend v4.1 user (includes customData: custom1..custom22, orgUnit1..orgUnit6, plus spend extensions)
       - Travel v4 user (travel extension data)
 
@@ -557,16 +591,19 @@ def api_user_detail_full(
         or current_user.get("email")
     )
 
+    # Identity is the anchor (must succeed)
     identity = get_user_detail_identity(user_id)
 
     partial_failures: Dict[str, Any] = {}
 
+    # Spend (optional)
     try:
         spend = get_user_detail_spend(user_id)
     except HTTPException as he:
         spend = None
         partial_failures["spend"] = he.detail
 
+    # Travel (optional)
     try:
         travel = get_user_detail_travel(user_id)
     except HTTPException as he:
