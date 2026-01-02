@@ -1,0 +1,45 @@
+name: Build & Deploy (FastAPI -> Azure App Service)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  APP_NAME: rg-concur-accruals-poc
+  ZIP_NAME: app.zip
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify expected structure
+        run: |
+          test -f main.py
+          test -f requirements.txt
+          test -d services
+          test -d auth
+          echo "Repo structure looks OK."
+
+      - name: Create Linux-safe deployment ZIP (no top-level folder)
+        run: |
+          rm -f "${ZIP_NAME}"
+          zip -r "${ZIP_NAME}" \
+            main.py requirements.txt \
+            services auth reports exports logic models \
+            -x "**/__pycache__/*" "*.pyc" ".git/*" ".github/*"
+          echo "ZIP content (top 50 lines):"
+          unzip -l "${ZIP_NAME}" | head -n 50
+          echo "Confirm folders present:"
+          unzip -l "${ZIP_NAME}" | grep -E "^(.*\s)?(services/|auth/|reports/)" | head -n 20
+
+      - name: Deploy to Azure Web App (zip)
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ env.APP_NAME }}
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+          package: ${{ env.ZIP_NAME }}
