@@ -4,23 +4,18 @@ set -euo pipefail
 cd /home/site/wwwroot
 
 echo "== Python =="
-python -V || true
+python3 --version
 
-# Create a clean venv if missing or broken
-if [ ! -x "antenv/bin/python" ]; then
-  echo "== Creating venv =="
-  rm -rf antenv
-  python -m venv antenv
+VENV="/home/site/antenv"
+
+if [ ! -d "$VENV" ]; then
+  echo "== Creating venv at $VENV =="
+  python3 -m venv "$VENV"
 fi
 
-echo "== Installing requirements =="
-./antenv/bin/python -m pip install --upgrade pip
-./antenv/bin/pip install -r requirements.txt
+source "$VENV/bin/activate"
 
-echo "== Starting gunicorn =="
-exec ./antenv/bin/gunicorn \
-  -k uvicorn.workers.UvicornWorker \
-  --bind 0.0.0.0:${PORT:-8000} \
-  --workers 2 \
-  --timeout 600 \
-  main:app
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+
+exec gunicorn -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:${PORT:-8000} --workers 2 --timeout 600 main:app
