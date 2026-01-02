@@ -518,7 +518,7 @@ def list_users_tenant_safe(take: int) -> Tuple[List[Dict[str, Any]], str]:
         raise
 
 
-def get_user_detail_identity(user_id: str)
+def get_user_detail_identity(user_id: str):
 
 
 # ======================================================
