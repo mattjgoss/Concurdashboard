@@ -1,0 +1,511 @@
+1) Technical End-to-End Working Path (Employee Search)
+1.1 What the user does in SharePoint
+
+User opens a SharePoint page containing the Concur Accruals SPFx web part.
+
+User clicks Load Users.
+
+The web part calls your FastAPI backend endpoint:
+
+GET {apiBaseUrl}/api/users?take=500
+
+Users render in a grid (Display Name, Username, Email, Employee #, Active).
+
+User clicks View on any row.
+
+The web part calls:
+
+GET {apiBaseUrl}/api/users/{userId}
+
+The web part displays:
+
+Basic summary fields (from the grid)
+
+Full raw SCIM JSON returned by Concur (Identity v4.1)
+
+This creates a complete “list → select → detail view” experience.
+
+1.2 Authentication path (SharePoint → FastAPI)
+Who authenticates to what
+
+SharePoint user authenticates to Microsoft Entra ID.
+
+SPFx uses AadHttpClient/AadHttpClientFactory to request an access token for your FastAPI API App Registration.
+
+That access token is sent as:
+
+Authorization: Bearer <token>
+
+FastAPI validates that token and extracts user identity (UPN, oid, scp, aud, etc.).
+
+Required token characteristics (known working)
+
+aud = api://<FASTAPI_APP_ID>
+
+scp includes user_impersonation
+
+Token is a v2 token (scoped token) obtained using:
+
+--scope api://<api-id>/user_impersonation
+
+What FastAPI does with the token
+
+Your FastAPI endpoints that are protected use:
+
+Depends(get_current_user)
+
+That dependency:
+
+Checks presence of Authorization: Bearer ...
+
+Validates signature/issuer/audience/scopes per your Entra setup
+
+Returns a claims dictionary (UPN, name, oid, etc.)
+
+Example verification endpoint:
+
+GET /api/whoami → returns the decoded claims (this proved end-to-end auth is working)
+
+✅ Outcome: SharePoint → FastAPI auth is proven working and repeatable.
+
+1.3 FastAPI → Concur authentication path
+How the backend authenticates to Concur
+
+FastAPI uses a Concur OAuth 2.0 refresh token flow (application-held refresh token) to obtain an access token for Concur API calls.
+
+FastAPI loads Concur credentials from:
+
+Azure Key Vault (preferred), with env var fallback
+
+It creates a cached ConcurOAuthClient (in-process) that:
+
+Exchanges refresh token → access token
+
+Caches access token until expiry
+
+Every Concur call adds:
+
+Authorization: Bearer <concur_access_token>
+
+✅ Outcome: FastAPI can authenticate to Concur and call Concur APIs reliably.
+
+1.4 Concur APIs used for Employee Search
+A) List users (grid)
+
+FastAPI endpoint:
+
+GET /api/users?take=500
+
+Concur API called by FastAPI:
+
+GET /profile/identity/v4.1/Users
+
+Key query parameters:
+
+startIndex (paging)
+
+count (page size)
+
+attributes (fields requested)
+
+Important tenant constraint discovered and handled
+Your tenant rejects the Concur extension schema in the attributes parameter:
+
+Rejected:
+urn:ietf:params:scim:schemas:extension:concur:2.0:User
+
+So the implementation must be tenant-safe:
+
+Attempt 1 (richer attributes)
+Includes enterprise + concur extensions
+If Concur returns 400 with “Unrecognized attributes”, fallback is triggered.
+
+Attempt 2 (safe attributes)
+Uses only:
+
+core User fields
+
+enterprise extension
+
+✅ Working mode observed: attributeMode = "no_concur_extension"
+
+B) User details (full record)
+
+FastAPI endpoint:
+
+GET /api/users/{userId}
+
+Concur API called:
+
+GET /profile/identity/v4.1/Users/{userId}
+
+This returns:
+
+Core SCIM fields
+
+Enterprise extension
+
+SAP extension (as your tenant supports it)
+
+Locale overrides, addresses, etc.
+
+✅ Working: user detail call returns complete JSON record.
+
+1.5 Data mapping from Concur → API → SPFx
+List view mapping (FastAPI → SPFx grid)
+
+FastAPI normalizes Concur SCIM user records into a simple list:
+
+SPFx grid uses:
+
+id
+
+displayName
+
+userName
+
+email (primary email extracted)
+
+active
+
+employeeNumber (from enterprise extension)
+
+It also returns metadata:
+
+requestedBy (Entra user UPN)
+
+returned (count)
+
+concurBaseUrl (eu2)
+
+attributeMode (with/without extension)
+
+Detail view mapping (FastAPI → SPFx panel)
+
+SPFx calls /api/users/{id} and displays:
+
+Selected summary fields + raw JSON payload
+
+This is intentional:
+
+It proves the “full data” is available immediately
+
+It gives a stable building block for future structured screens (expense, cards, org units, etc.)
+
+1.6 Azure hosting endpoints used for testing
+
+These were used to validate environment health and auth:
+
+GET /build — shows deployment fingerprint/run mode
+
+GET /kv-test — confirms Key Vault connectivity and secret retrieval
+
+GET /auth/config-status — confirms Entra config loaded correctly
+
+GET /api/whoami — confirms Bearer token validation
+
+GET /api/concur/auth-test — confirms Concur OAuth + API access
+
+✅ Outcome: You have a clean diagnostic surface for production support.
+
+2) Implementation Guide (Non-Technical, Step-by-Step)
+
+This section is written for someone who can follow instructions but isn’t deep in SPFx/FastAPI.
+
+2.1 What you are deploying
+
+You deploy two components:
+
+Component A — Azure backend (FastAPI)
+
+Hosts the API that talks to Concur
+
+Protected by Microsoft Entra
+
+Connects to Concur using refresh token credentials stored in Key Vault
+
+Component B — SharePoint frontend (SPFx web part)
+
+Runs inside SharePoint
+
+Lets users load/search Concur employees
+
+Uses Entra to get a token and call the Azure backend securely
+
+2.2 Prerequisites
+
+You will need:
+
+Azure subscription access (to App Service + Key Vault + Entra App Registrations)
+
+SharePoint tenant access (to App Catalog + API permission approvals)
+
+Concur API credentials (client id/secret + refresh token + token URL + base URL)
+
+A) Azure Backend Setup (FastAPI)
+A.1 Create App Service (Linux)
+
+Create an Azure App Service (Linux)
+
+Runtime: Python 3.11
+
+Set the startup command (known stable):
+
+exec gunicorn -k uvicorn.workers.UvicornWorker main:app \
+  --bind 0.0.0.0:$PORT \
+  --workers 2 \
+  --timeout 600
+
+
+Confirm WEBSITES_PORT is correct (App Service normally sets $PORT automatically).
+
+A.2 Create Key Vault + store secrets
+
+Create Azure Key Vault
+
+Add secrets (names must match your app’s code expectations). Common pattern used:
+
+concur-api-base-url (e.g. https://eu2.api.concursolutions.com)
+
+concur-token-url
+
+concur-client-id
+
+concur-client-secret
+
+concur-refresh-token
+
+Enable App Service Managed Identity
+
+Grant that managed identity Key Vault Secrets User (or equivalent get/list access)
+
+A.3 Create Entra “API App Registration” (FastAPI)
+
+In Entra ID → App registrations → New registration
+
+Single tenant
+
+Expose an API:
+
+Application ID URI: api://<APPLICATION_ID>
+
+Add scope:
+
+user_impersonation
+
+This is what SPFx uses to request a token for your API.
+
+A.4 Configure App Service Authentication
+
+App Service → Authentication → Enable
+
+Identity provider: Microsoft
+
+Set it to use your tenant
+
+For API usage you can run in two modes:
+
+Mode 1 (API-strict)
+
+Require authentication
+
+Unauthenticated = 401
+
+This blocks /docs unless you are logged in via Easy Auth.
+
+Mode 2 (recommended for development)
+
+Allow unauthenticated access
+
+Let FastAPI enforce Bearer tokens via get_current_user
+
+This makes /docs and /openapi.json accessible for easier testing, while /api/* remains protected by your FastAPI auth dependency.
+
+A.5 Deploy FastAPI code
+
+Deploy your FastAPI app files into App Service (zip deploy, GitHub actions, etc.).
+
+After deploy, test:
+
+Health check:
+
+GET https://<app>/build
+
+Key Vault connectivity:
+
+GET https://<app>/kv-test
+
+Entra token auth:
+
+GET https://<app>/api/whoami with a Bearer token
+
+Concur connectivity:
+
+GET https://<app>/api/concur/auth-test with a Bearer token
+
+User list:
+
+GET https://<app>/api/users?take=5 with a Bearer token
+
+B) SharePoint (SPFx Web Part) Setup
+B.1 Update the web part code
+
+Replace the web part UI code (ConcurAccruals.tsx + scss) with the new list/detail UI.
+
+The web part expects these properties:
+
+apiBaseUrl — the Azure App Service URL
+
+getAadClient() — returns AadHttpClient configured for the API App ID URI
+
+B.2 Set API permissions in SPFx
+
+In the web part configuration, ensure SPFx knows the API endpoint it is allowed to call.
+
+This is done using the web part’s API permissions setup (your project already had it working previously).
+
+You will need:
+
+The API Application ID URI (example):
+
+api://648a2fa4-dc6d-429c-8c50-ce51f48beb24
+
+Scope required:
+
+user_impersonation
+
+B.3 Build and package SPFx
+
+From the SPFx project folder run:
+
+gulp clean
+gulp bundle --ship
+gulp package-solution --ship
+
+
+This creates:
+
+sharepoint/solution/<solution>.sppkg
+
+B.4 Versioning (important)
+
+Because your web part manifest uses "version": "*", you bump versions in:
+
+package.json → "version": "x.y.z.n"
+
+config/package-solution.json → solution.version: "x.y.z.n"
+
+Then rebuild/package again before uploading.
+
+B.5 Upload to SharePoint App Catalog
+
+Go to SharePoint App Catalog
+
+Upload the .sppkg
+
+Click Deploy
+
+If this is an update, choose Upgrade
+
+B.6 Approve API permission requests (critical)
+
+In SharePoint Admin Center:
+
+Go to API access
+
+Approve the request for:
+
+your API App Registration
+
+scope user_impersonation
+
+Without approval, SPFx will not be allowed to acquire tokens for your backend.
+
+B.7 Add the web part to a SharePoint page
+
+Edit a SharePoint page
+
+Add the web part
+
+Set the web part property:
+
+apiBaseUrl = https://<yourapp>.azurewebsites.net
+
+Save and publish
+
+2.3 How to Test (end-to-end)
+
+Open SharePoint page with the web part
+
+Click Load Users
+
+Confirm:
+
+Users appear
+
+Metadata shows requestedBy and concurBaseUrl
+
+Click View on a user
+
+Confirm:
+
+A panel opens
+
+Raw SCIM JSON appears
+
+✅ Proof of concept complete.
+
+3) Concur API Endpoints Used (Employee Search Building Block)
+List users
+
+GET /profile/identity/v4.1/Users
+
+Query params:
+
+startIndex
+
+count
+
+attributes
+
+Get a user by ID
+
+GET /profile/identity/v4.1/Users/{userId}
+
+These are the only Concur endpoints required for the employee search function you implemented.
+
+4) Why this is the right “building block” for more functionality
+
+This architecture is reusable for all future “tiles”:
+
+SPFx UI button → calls FastAPI endpoint (Bearer token)
+
+FastAPI validates Entra identity
+
+FastAPI calls Concur API(s) using Concur OAuth refresh token
+
+FastAPI returns normalized JSON for UI rendering
+
+Optional export endpoints return Excel files
+
+Next logical expansions:
+
+Expense Reports list/detail
+
+Expense accrual calculations
+
+Workflow status dashboards
+
+(Later) any constrained APIs that require user tokens can be handled on a per-user basis
+
+If you want, I can turn the above into a clean “client-ready” document format
+
+If you want this as a deliverable (Word/PDF style), say the word and I’ll produce a structured implementation document with:
+
+Architecture diagram (text + sequence steps)
+
+Config tables (all settings/variables/secrets)
+
+Deployment runbook (copy/paste commands)
+
+Troubleshooting checklist (top 20 failures + fixes)

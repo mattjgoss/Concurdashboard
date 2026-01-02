@@ -1,909 +1,1309 @@
-# Concur Accruals API - Technical Documentation
+# Concur Users API - Technical Documentation
 
-## Overview
+**Version**: 4.0  
+**Last Updated**: 2026-01-02  
+**Purpose**: SharePoint-integrated Concur Identity user management system
 
-A FastAPI microservice providing SAP Concur expense card management for SharePoint SPFx integration. The primary use case is enabling SharePoint users to view and export their own unassigned card transactions, with legacy support for organization-wide accruals reporting.
+---
 
-**Primary Integration**: SharePoint SPFx web parts using Azure AD OAuth 2.0  
-**Authentication**: Dual-layer (Azure AD JWT for client auth + Concur OAuth for API access)  
-**Deployment Target**: Azure App Service with Managed Identity  
-**Configuration**: Azure Key Vault with in-memory caching  
+## Table of Contents
+
+1. [Executive Summary](#executive-summary)
+2. [Architecture Overview](#architecture-overview)
+3. [Authentication Deep Dive](#authentication-deep-dive)
+4. [Azure Key Vault Integration](#azure-key-vault-integration)
+5. [API Endpoints Reference](#api-endpoints-reference)
+6. [Data Flow Diagrams](#data-flow-diagrams)
+7. [Concur Identity API Integration](#concur-identity-api-integration)
+8. [Error Handling Strategy](#error-handling-strategy)
+9. [Configuration Management](#configuration-management)
+10. [Deployment Guide](#deployment-guide)
+11. [Troubleshooting](#troubleshooting)
+
+---
+
+## Executive Summary
+
+This FastAPI microservice provides a **simplified, SharePoint-integrated interface** to SAP Concur's Identity API. The primary use case is enabling SharePoint users to browse and export Concur user data through a web part.
+
+### Key Capabilities
+
+- **User Listing**: Retrieve Concur users with SCIM v2.0 pagination
+- **User Details**: Fetch full SCIM profile for individual users
+- **Excel Export**: Generate Excel reports of user data
+- **Tenant-Safe Attributes**: Automatically falls back when Concur extensions unavailable
+- **Azure AD Authentication**: Secure SharePoint integration via JWT validation
+- **Diagnostic Tools**: Health checks, auth tests, and config verification
+
+### Technology Stack
+
+| Component | Technology |
+|-----------|------------|
+| Framework | FastAPI 0.115.6 |
+| Runtime | Python 3.11+ |
+| Authentication | Azure AD JWT + Concur OAuth 2.0 |
+| Secrets | Azure Key Vault (Managed Identity) |
+| Deployment | Azure App Service |
+| API Integration | SAP Concur Identity v4.1 (SCIM) |
 
 ---
 
 ## Architecture Overview
 
-### System Layers
+### High-Level System Diagram
 
 ```
-┌─────────────────────────────────────────────────────┐
-│         SharePoint User (Browser)                   │
-└──────────────────────┬──────────────────────────────┘
-                       │ HTTPS + Azure AD JWT
-                       ▼
-┌─────────────────────────────────────────────────────┐
-│            FastAPI Application                       │
-│  ┌───────────────────────────────────────────────┐  │
-│  │ CORS Middleware (SP origin whitelist)        │  │
-│  └───────────┬───────────────────────────────────┘  │
-│              ▼                                       │
-│  ┌───────────────────────────────────────────────┐  │
-│  │ Azure AD JWT Validation                       │  │
-│  │ - Extract user UPN from token                 │  │
-│  │ - Verify signature, audience, issuer          │  │
-│  └───────────┬───────────────────────────────────┘  │
-│              ▼                                       │
-│  ┌───────────────────────────────────────────────┐  │
-│  │ User Identity Resolution                      │  │
-│  │ - UPN → Concur User ID via Identity API      │  │
-│  └───────────┬───────────────────────────────────┘  │
-│              ▼                                       │
-│  ┌───────────────────────────────────────────────┐  │
-│  │ Cards API Integration                         │  │
-│  │ - Fetch transactions for user                 │  │
-│  │ - Defensive pagination (handles tenant quirks)│  │
-│  │ - Filter unassigned (no expenseId/reportId)   │  │
-│  └───────────┬───────────────────────────────────┘  │
-│              ▼                                       │
-│  ┌───────────────────────────────────────────────┐  │
-│  │ Response Generation                           │  │
-│  │ - JSON (for UI) OR                            │  │
-│  │ - Excel export (via template)                 │  │
-│  └───────────────────────────────────────────────┘  │
-└──────────────┼───────────────────────────────────────┘
-               │
-               ▼
-┌──────────────────────────────────────────────────────┐
-│      Azure Key Vault (Managed Identity)              │
-│  - Concur OAuth credentials (cached 5min)            │
-│  - Access token (cached in ConcurOAuthClient)        │
-└───────────────────────────────────────────────────────┘
-               │
-               ▼
-┌───────────────────────────────────────────────────────┐
-│            SAP Concur APIs                            │
-│  - Identity v4.1 (user resolution via SCIM)          │
-│  - Cards v4 (transaction queries with pagination)     │
-│  - Expense Reports v4 (legacy org-wide endpoint only) │
-└───────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                   SharePoint Online                          │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │         SPFx Web Part (React)                         │  │
+│  │  - User clicks "Load Users"                            │  │
+│  │  - AadHttpClient auto-attaches Azure AD JWT           │  │
+│  └──────────────────────┬─────────────────────────────────┘  │
+└─────────────────────────┼─────────────────────────────────────┘
+                          │ HTTPS Request
+                          │ Authorization: Bearer <JWT>
+                          │ x-request-id: <UUID>
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│              Azure App Service (Linux)                       │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  NGINX Reverse Proxy  │  ┌──────────────────────────┐  │  │
+│  │  (:80 → :8000)        │  │  Gunicorn (4 workers)    │  │  │
+│  └────────────────────────┘  │  ├─ Uvicorn Worker 1   │  │  │
+│                              │  ├─ Uvicorn Worker 2   │  │  │
+│  ┌────────────────────────┐  │  ├─ Uvicorn Worker 3   │  │  │
+│  │  CORS Middleware       │  │  └─ Uvicorn Worker 4   │  │  │
+│  │  (SharePoint origin)   │  └──────────────────────────┘  │  │
+│  └──────────┬─────────────┘                                 │  │
+│             ▼                                                │  │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  Azure AD JWT Validation (auth/azure_ad.py)           │  │
+│  │  1. Extract Bearer token from header                   │  │
+│  │  2. Decode JWT header → extract kid (key ID)          │  │
+│  │  3. Fetch Microsoft JWKS public keys                   │  │
+│  │  4. Verify RS256 signature                             │  │
+│  │  5. Validate: exp, aud, iss, nbf claims               │  │
+│  │  6. Return decoded payload (upn, oid, name, etc.)     │  │
+│  └──────────┬─────────────────────────────────────────────┘  │
+│             ▼                                                │  │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  API Route Handler (/api/users)                        │  │
+│  │  - Receives: current_user dict from dependency         │  │
+│  │  - Calls: list_users_tenant_safe()                     │  │
+│  └──────────┬─────────────────────────────────────────────┘  │
+│             ▼                                                │  │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  Concur OAuth Client (Singleton)                       │  │
+│  │  - Lazy initialization on first API call               │  │
+│  │  - Credentials from Key Vault or env vars             │  │
+│  │  - Token caching (30min with 60s buffer)              │  │
+│  │  - Automatic refresh on expiration                     │  │
+│  └──────────┬─────────────────────────────────────────────┘  │
+│             ▼                                                │  │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  Concur Identity API Client                            │  │
+│  │  - Pagination: startIndex/count                        │  │
+│  │  - Tenant-safe attributes (fallback if 400)           │  │
+│  │  - Error enrichment (context + truncated response)     │  │
+│  └──────────┬─────────────────────────────────────────────┘  │
+└─────────────┼─────────────────────────────────────────────────┘
+              │ Outbound HTTPS
+              ▼
+┌─────────────────────────────────────────────────────────────┐
+│           Azure Key Vault (via Managed Identity)             │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  Secrets:                                              │  │
+│  │  - concur-api-base-url                                 │  │
+│  │  - concur-token-url                                    │  │
+│  │  - concur-client-id                                    │  │
+│  │  - concur-client-secret                                │  │
+│  │  - concur-refresh-token                                │  │
+│  │                                                         │  │
+│  │  Access:                                               │  │
+│  │  - App Service Managed Identity (system-assigned)      │  │
+│  │  - Permissions: Get, List (secret operations)          │  │
+│  │  - Caching: 5 minutes in-memory per secret            │  │
+│  └────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+              │
+              ▼
+┌─────────────────────────────────────────────────────────────┐
+│              SAP Concur APIs                                 │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  OAuth 2.0 Endpoint:                                   │  │
+│  │  POST /oauth2/v0/token                                 │  │
+│  │  - grant_type: refresh_token                           │  │
+│  │  - Responds: access_token (30min TTL)                  │  │
+│  └────────────────────────────────────────────────────────┘  │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  Identity v4.1 (SCIM 2.0):                            │  │
+│  │  GET /profile/identity/v4.1/Users                      │  │
+│  │  - Pagination: startIndex, count                       │  │
+│  │  - Filter support: userName, emails, enterprise ext    │  │
+│  │  - Returns: SCIM Resources array                       │  │
+│  └────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
 ```
+
+### Component Responsibilities
+
+| Component | Responsibility | State Management |
+|-----------|---------------|------------------|
+| **CORS Middleware** | Origin validation, preflight handling | Stateless |
+| **Azure AD JWT Validator** | Token signature/claims verification | Stateless (JWKS cache in `auth/azure_ad.py`) |
+| **OAuth Client Singleton** | Concur access token lifecycle | Process-scoped (per Gunicorn worker) |
+| **Key Vault Client** | Secret retrieval with caching | Process-scoped (5min cache) |
+| **Identity API Client** | SCIM user queries, pagination | Stateless |
 
 ---
 
-## Project Structure
+## Authentication Deep Dive
+
+### Two-Layer Authentication Architecture
+
+This application uses **dual authentication**:
+1. **Client Authentication** (SharePoint → API): Azure AD JWT
+2. **Service Authentication** (API → Concur): OAuth 2.0 Refresh Token
 
 ```
-├── main.py                          # FastAPI app + all endpoints
-├── requirements.txt                 # Python dependencies
-├── .deployment                      # Azure deployment config
-│
-├── auth/
-│   ├── __init__.py                  # Package exports
-│   ├── azure_ad.py                  # Azure AD JWT validation (SharePoint)
-│   └── concur_oauth.py              # Concur OAuth refresh token client (standalone)
-│
-├── services/
-│   ├── __init__.py                  
-│   ├── identity_service.py          # Azure Key Vault access + Concur Identity helpers
-│   ├── excel_export.py              # OpenPyXL report generation
-│   └── cards_service.py             # (Not used by main.py; separate implementation)
-│
-├── logic/
-│   └── card_totals.py               # (Not used; legacy aggregation code)
-│
-├── models/
-│   ├── requests.py                  # Pydantic request models
-│   ├── responses.py                 # Response models
-│   └── __init__.py
-│
-└── reports/
-    └── accrual report.xlsx          # Excel template (must be in deployment package)
+┌──────────────────────────────────────────────────────────────┐
+│  Authentication Layer 1: SharePoint User → API               │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  SharePoint User Identity                              │  │
+│  │  ├─ Azure AD UPN: user@contoso.com                     │  │
+│  │  ├─ Object ID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx   │  │
+│  │  └─ Groups/Roles: [SharePoint Members, ...]           │  │
+│  └──────────────────────┬─────────────────────────────────┘  │
+│                         │                                    │
+│                         │ SPFx calls AadHttpClient           │
+│                         ▼                                    │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  Azure AD Token Service (Microsoft)                    │  │
+│  │  1. Authenticates user                                 │  │
+│  │  2. Issues JWT for API (audience = API app ID)         │  │
+│  │  3. Signs with RS256 (private key)                     │  │
+│  │  4. Includes claims: upn, oid, scp, aud, iss, exp      │  │
+│  └──────────────────────┬─────────────────────────────────┘  │
+│                         │                                    │
+│                         │ Token embedded in Authorization    │
+│                         ▼                                    │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  API Receives Request                                  │  │
+│  │  Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJ...  │  │
+│  └──────────────────────┬─────────────────────────────────┘  │
+│                         │                                    │
+│                         │ Dependency injection triggers      │
+│                         ▼                                    │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  get_current_user() Dependency (auth/azure_ad.py)     │  │
+│  │  ┌──────────────────────────────────────────────────┐  │  │
+│  │  │  Step 1: Extract token                           │  │  │
+│  │  │  - Parse Authorization header                      │  │  │
+│  │  │  - Validate format: "Bearer <token>"              │  │  │
+│  │  └──────────────────────────────────────────────────┘  │  │
+│  │  ┌──────────────────────────────────────────────────┐  │  │
+│  │  │  Step 2: Decode JWT header (no verification)     │  │  │
+│  │  │  - Extract kid (key ID)                           │  │  │
+│  │  │  - Extract alg (must be RS256)                     │  │  │
+│  │  └──────────────────────────────────────────────────┘  │  │
+│  │  ┌──────────────────────────────────────────────────┐  │  │
+│  │  │  Step 3: Fetch signing key                        │  │  │
+│  │  │  - URL: login.microsoftonline.com/{tenant}/       │  │  │
+│  │  │         discovery/v2.0/keys                       │  │  │
+│  │  │  - Find key matching kid                          │  │  │
+│  │  │  - Cache keys (PyJWKClient @lru_cache)            │  │  │
+│  │  └──────────────────────────────────────────────────┘  │  │
+│  │  ┌──────────────────────────────────────────────────┐  │  │
+│  │  │  Step 4: Verify signature                         │  │  │
+│  │  │  - Use public key from JWKS                       │  │  │
+│  │  │  - Verify RS256 signature                         │  │  │
+│  │  │  - Raises JWTError if invalid                      │  │  │
+│  │  └──────────────────────────────────────────────────┘  │  │
+│  │  ┌──────────────────────────────────────────────────┐  │  │
+│  │  │  Step 5: Validate claims                          │  │  │
+│  │  │  - exp: Token not expired                         │  │  │
+│  │  │  - nbf: Token valid (not before)                   │  │  │
+│  │  │  - aud: Matches AZURE_AD_APP_ID or APP_ID_URI     │  │  │
+│  │  │  - iss: From correct Azure AD tenant              │  │  │
+│  │  └──────────────────────────────────────────────────┘  │  │
+│  │  ┌──────────────────────────────────────────────────┐  │  │
+│  │  │  Step 6: Return user payload                      │  │  │
+│  │  │  {                                                │  │  │
+│  │  │    "upn": "user@contoso.com",                     │  │  │
+│  │  │    "oid": "uuid",                                 │  │  │
+│  │  │    "name": "John Smith",                          │  │  │
+│  │  │    "scp": "access_as_user",                       │  │  │
+│  │  │    "aud": "api://concur-users-api",               │  │  │
+│  │  │    "iss": "https://sts.windows.net/{tenant}/",    │  │  │
+│  │  │    "exp": 1735689600,                             │  │  │
+│  │  │    "x-request-id": "uuid-from-header"             │  │  │
+│  │  │  }                                                 │  │  │
+│  │  └──────────────────────────────────────────────────┘  │  │
+│  └────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────┐
+│  Authentication Layer 2: API → Concur                        │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  OAuth Client Initialization (First API Call)          │  │
+│  │  1. Load credentials from Key Vault:                   │  │
+│  │     - concur-token-url                                 │  │
+│  │     - concur-client-id                                 │  │
+│  │     - concur-client-secret                             │  │
+│  │     - concur-refresh-token                             │  │
+│  │  2. Instantiate ConcurOAuthClient(...)                │  │
+│  │  3. Store in global _oauth_client variable            │  │
+│  └──────────────────────┬─────────────────────────────────┘  │
+│                         │                                    │
+│                         │ On each Concur API call            │
+│                         ▼                                    │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  get_access_token() Logic                              │  │
+│  │  ┌──────────────────────────────────────────────────┐  │  │
+│  │  │  Check: Is cached token still valid?             │  │  │
+│  │  │  - now < expires_at - 60 seconds                  │  │  │
+│  │  │  - If YES: return cached token                    │  │  │
+│  │  │  - If NO: proceed to refresh                      │  │  │
+│  │  └──────────────────────────────────────────────────┘  │  │
+│  │  ┌──────────────────────────────────────────────────┐  │  │
+│  │  │  Refresh Token Flow                               │  │  │
+│  │  │  POST {token_url}                                 │  │  │
+│  │  │  Body:                                            │  │  │
+│  │  │    grant_type: "refresh_token"                    │  │  │
+│  │  │    refresh_token: {current_refresh_token}         │  │  │
+│  │  │    client_id: {client_id}                         │  │  │
+│  │  │    client_secret: {client_secret}                 │  │  │
+│  │  └──────────────────────────────────────────────────┘  │  │
+│  │  ┌──────────────────────────────────────────────────┐  │  │
+│  │  │  Response:                                        │  │  │
+│  │  │  {                                                │  │  │
+│  │  │    "access_token": "...",                         │  │  │
+│  │  │    "token_type": "Bearer",                        │  │  │
+│  │  │    "expires_in": 1800,  // 30 minutes            │  │  │
+│  │  │    "refresh_token": "..." // may rotate          │  │  │
+│  │  │  }                                                 │  │  │
+│  │  └──────────────────────────────────────────────────┘  │  │
+│  │  ┌──────────────────────────────────────────────────┐  │  │
+│  │  │  Cache Update                                     │  │  │
+│  │  │  - self._access_token = response["access_token"]  │  │  │
+│  │  │  - self._expires_at = now + expires_in           │  │  │
+│  │  │  - If new refresh_token: update self.refresh_token│  │  │
+│  │  └──────────────────────────────────────────────────┘  │  │
+│  └────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-**Note**: The application has a monolithic structure with all business logic in `main.py`. The `services/` directory contains reusable components, but endpoint implementations live in the main module.
+### JWT Token Claims Breakdown
+
+**Standard Claims**:
+- `aud` (audience): API application ID or Application ID URI
+- `iss` (issuer): `https://sts.windows.net/{tenant-id}/` or `https://login.microsoftonline.com/{tenant-id}/v2.0`
+- `exp` (expiration): Unix timestamp (typically `now + 1 hour`)
+- `nbf` (not before): Unix timestamp
+- `iat` (issued at): Unix timestamp
+
+**User Identity Claims**:
+- `upn` (user principal name): Primary email/login
+- `unique_name`: Alternative identity claim
+- `preferred_username`: Another identity variant
+- `oid` (object ID): Permanent user identifier in Azure AD
+- `name`: Display name
+
+**Application Claims**:
+- `scp` (scopes): Space-separated list (e.g., `"access_as_user"`)
+- `app_displayname`: Client application name
+- `appid`: Client application ID
+- `x-request-id`: Custom header (correlation ID from SharePoint)
 
 ---
 
-## Core Implementation
+## Azure Key Vault Integration
 
-### 1. Configuration Management
+### Managed Identity Authentication
 
-#### Helper Functions
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Azure App Service Managed Identity Flow                     │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  App Service Configuration                             │  │
+│  │  - System-Assigned Managed Identity: Enabled           │  │
+│  │  - Principal ID: auto-generated by Azure               │  │
+│  │  - No credentials needed in code                       │  │
+│  └──────────────────────┬─────────────────────────────────┘  │
+│                         │                                    │
+│                         │ App requests secret                │
+│                         ▼                                    │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  DefaultAzureCredential Chain (azure-identity)         │  │
+│  │  Tries in order:                                       │  │
+│  │  1. EnvironmentCredential (env vars) - Skip           │  │
+│  │  2. ManagedIdentityCredential - Success!              │  │
+│  │     - Queries: http://169.254.169.254/metadata/...     │  │
+│  │     - Returns: access token for Key Vault             │  │
+│  │  3. AzureCliCredential - Not tried                     │  │
+│  │  4. ... other credential types                         │  │
+│  └──────────────────────┬─────────────────────────────────┘  │
+│                         │                                    │
+│                         │ Token attached to request          │
+│                         ▼                                    │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  Azure Key Vault API                                   │  │
+│  │  GET https://{vault}.vault.azure.net/secrets/{name}    │  │
+│  │  Headers:                                              │  │
+│  │    Authorization: Bearer {managed-identity-token}      │  │
+│  └──────────────────────┬─────────────────────────────────┘  │
+│                         │                                    │
+│                         │ Validates identity via AAD         │
+│                         │ Checks access policy               │
+│                         ▼                                    │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  Key Vault Access Policy Check                         │  │
+│  │  - Principal: {app-service-principal-id}               │  │
+│  │  - Permissions: Get, List (secrets)                    │  │
+│  │  - If authorized: return secret value                  │  │
+│  │  - If denied: 403 Forbidden                            │  │
+│  └──────────────────────┬─────────────────────────────────┘  │
+│                         │                                    │
+│                         │ Secret value returned              │
+│                         ▼                                    │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  In-Memory Cache (services/identity_service.py)        │  │
+│  │  _SECRET_CACHE = {                                     │  │
+│  │    "concur-client-id": {                               │  │
+│  │      "value": "abc123...",                             │  │
+│  │      "ts": 1735689000.0  // 5min TTL                  │  │
+│  │    }                                                    │  │
+│  │  }                                                      │  │
+│  └────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────┘
+```
 
+### Secret Lifecycle
+
+**Initial Fetch** (Cold Start):
+1. App starts → no secrets cached
+2. First API call triggers `get_oauth_client()`
+3. Calls `kv("concur-client-id")` → `get_secret("concur-client-id")`
+4. Managed Identity auth → Key Vault GET
+5. Cache entry created with timestamp
+6. Secret returned to caller
+
+**Subsequent Fetches** (Warm):
+1. API call triggers `kv("concur-client-id")`
+2. Check cache: `now - cached["ts"] < 300 seconds`
+3. If valid: return `cached["value"]`
+4. If expired: Fetch from Key Vault again
+
+**Fallback Strategy**:
 ```python
-def env(name: str, fallback: Optional[str] = None) -> Optional[str]:
-    """Read environment variable, return fallback if missing/empty."""
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return fallback
-    return v
-
 def kv(name: str, fallback: Optional[str] = None) -> Optional[str]:
-    """
-    Read from Azure Key Vault with fallback to environment variable.
-    Uses services.identity_service.get_secret() which:
-    - Authenticates via Managed Identity
-    - Caches secrets in-memory for 5 minutes
-    - Raises exception if Key Vault unavailable
-    """
     try:
-        return get_secret(name)  # from services.identity_service
+        return get_secret(name)  # Try Key Vault
     except Exception:
-        return fallback  # silently fall back for local dev
-```
-
-#### Concur API Base URL
-
-```python
-def concur_base_url() -> str:
-    """
-    Priority order:
-    1. Key Vault secret: concur-api-base-url
-    2. Env var: CONCUR_API_BASE_URL
-    3. Env var: CONCUR_BASE_URL
-    4. Default: https://www.concursolutions.com
-    """
-    return (
-        kv("concur-api-base-url")
-        or env("CONCUR_API_BASE_URL")
-        or env("CONCUR_BASE_URL")
-        or "https://www.concursolutions.com"
-    ).rstrip("/")
-```
-
-**Why Multiple Fallbacks**: Supports both local development (env vars) and production (Key Vault) without code changes.
-
----
-
-### 2. Concur OAuth Client (Process-Scoped Singleton)
-
-```python
-_oauth_client: Optional[ConcurOAuthClient] = None
-
-def get_oauth_client() -> ConcurOAuthClient:
-    """
-    Lazily instantiate and cache a ConcurOAuthClient for the process lifetime.
-    
-    Config priority:
-    1. Key Vault secrets (concur-token-url, etc.)
-    2. Environment variables (CONCUR_TOKEN_URL, etc.)
-    
-    Raises HTTPException(500) if required credentials missing.
-    """
-    global _oauth_client
-    if _oauth_client is not None:
-        return _oauth_client
-    
-    # Fetch credentials (Key Vault first, then env vars)
-    token_url = kv("concur-token-url") or env("CONCUR_TOKEN_URL")
-    client_id = kv("concur-client-id") or env("CONCUR_CLIENT_ID")
-    client_secret = kv("concur-client-secret") or env("CONCUR_CLIENT_SECRET")
-    refresh_token = kv("concur-refresh-token") or env("CONCUR_REFRESH_TOKEN")
-    
-    # Validate all required
-    missing = []
-    if not token_url:
-        missing.append("concur-token-url / CONCUR_TOKEN_URL")
-    # ... (check all 4 required fields)
-    
-    if missing:
-        raise HTTPException(500, detail=f"Missing Concur OAuth config: {missing}")
-    
-    # Instantiate once
-    _oauth_client = ConcurOAuthClient(
-        token_url=token_url,
-        client_id=client_id,
-        client_secret=client_secret,
-        refresh_token=refresh_token,
-    )
-    return _oauth_client
-```
-
-**Key Behavior**:
-- **Singleton Pattern**: One instance per FastAPI worker process
-- **Lazy Loading**: Only instantiated on first API call requiring Concur access
-- **Token Caching**: `ConcurOAuthClient` handles access token caching (30min with 60s buffer)
-- **Credential Refresh**: Fetches from Key Vault on initialization only; credentials not reloaded per-request
-
----
-
-### 3. Authentication Flow
-
-#### Azure AD JWT Validation (from SharePoint)
-
-```python
-from auth.azure_ad import get_current_user
-
-@app.post("/api/cards/unassigned/search")
-def api_cards_unassigned_search(
-    req: UnassignedCardsRequest,
-    current_user: Dict[str, Any] = Depends(get_current_user)  # FastAPI dependency
-):
-    # current_user contains decoded JWT claims:
-    # - upn: user principal name (email)
-    # - oid: object ID
-    # - name: display name
-    # - x-request-id: correlation ID from SharePoint
-```
-
-**What `get_current_user` Does** (in `auth/azure_ad.py`):
-1. Extract `Bearer <token>` from `Authorization` header
-2. Decode JWT header to get `kid` (key ID)
-3. Fetch Microsoft public key from JWKS endpoint
-4. Verify RSA-256 signature
-5. Validate `exp` (expiration), `aud` (audience), `iss` (issuer), `nbf` (not-before)
-6. Return decoded payload as dict
-7. Raise `HTTPException(401)` if any validation fails
-
-#### Concur OAuth (for API Access)
-
-```python
-def concur_headers() -> Dict[str, str]:
-    """
-    Returns headers with a valid Concur access token.
-    Token automatically refreshed if expired.
-    """
-    oauth = get_oauth_client()
-    token = oauth.get_access_token()  # Cached or refreshed
-    return {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-    }
-```
-
-**Token Refresh Logic** (in `auth/concur_oauth.py`):
-```python
-def get_access_token(self) -> str:
-    now = time.time()
-    
-    # Return cached token if still valid (60s safety buffer)
-    if self._access_token and now < self._expires_at - 60:
-        return self._access_token
-    
-    # Refresh token via Concur OAuth endpoint
-    resp = requests.post(
-        self.token_url,
-        data={
-            "grant_type": "refresh_token",
-            "refresh_token": self.refresh_token,
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-        }
-    )
-    
-    data = resp.json()
-    self._access_token = data["access_token"]
-    self._expires_at = now + data.get("expires_in", 1800)  # Usually 30 min
-    
-    # Handle refresh token rotation (Concur may return new refresh token)
-    if "refresh_token" in data:
-        self.refresh_token = data["refresh_token"]
-    
-    return self._access_token
-```
-
----
-
-### 4. User Identity Resolution
-
-**Problem**: SharePoint provides Azure AD UPN (e.g., `user@contoso.com`), but Concur APIs require Concur User ID (UUID).
-
-**Solution**: `get_concur_user_id_for_upn()`
-
-```python
-def get_concur_user_id_for_upn(upn_or_email: str) -> str:
-    """
-    Resolve Azure AD UPN to Concur User ID via Identity v4.1 SCIM.
-    
-    Tries two SCIM filters:
-    1. userName eq "user@contoso.com"
-    2. emails.value eq "user@contoso.com"
-    
-    Returns: Concur user ID (UUID)
-    Raises: HTTPException(404) if no match found
-    """
-    url = f"{concur_base_url()}/profile/identity/v4.1/Users"
-    
-    for flt in (f'userName eq "{upn_or_email}"', f'emails.value eq "{upn_or_email}"'):
-        params = {"filter": flt, "startIndex": 1, "count": 1}
-        resp = requests.get(url, headers=concur_headers(), params=params, timeout=30)
-        resp.raise_for_status()
-        
-        resources = resp.json().get("Resources", []) or []
-        if resources and isinstance(resources, list):
-            user_id = resources[0].get("id")
-            if user_id:
-                return user_id  # Found!
-    
-    raise HTTPException(404, detail=f"Concur user not found for {upn_or_email}")
-```
-
-**Important**: This assumes Azure AD UPN matches Concur `userName` or `emails.value`. If your organization uses different identifiers, this logic needs to change.
-
----
-
-### 5. Cards API Integration with Defensive Pagination
-
-**Problem**: Concur Cards v4 API pagination behavior is tenant-dependent:
-- Some tenants honor `page`/`pageSize` parameters
-- Some tenants ignore pagination and always return first page
-- No official docs clarify this behavior
-
-**Solution**: Defensive pagination with infinite loop protection
-
-```python
-def get_card_transactions(
-    user_id: str,
-    date_from: str,
-    date_to: str,
-    status: Optional[str] = None,
-    page_size: int = 200
-) -> List[Dict]:
-    """
-    Fetch all card transactions for a user in a date range.
-    
-    Pagination strategy:
-    - Iterate page 1, 2, 3, ... until one of:
-      1. Empty response (no more data)
-      2. Fewer items than page_size (last page)
-      3. First transaction ID repeats (tenant ignores paging)
-      4. Max 100 pages reached (hard safety limit)
-    """
-    url = f"{concur_base_url()}/cards/v4/users/{user_id}/transactions"
-    
-    # Clamp page_size to sane range
-    page_size = max(1, min(page_size, 500))
-    
-    page = 1
-    seen_first_id: Optional[str] = None
-    all_items: List[Dict] = []
-    
-    while True:
-        params = {
-            "transactionDateFrom": date_from,
-            "transactionDateTo": date_to,
-            "page": page,
-            "pageSize": page_size,
-        }
-        if status:
-            params["status"] = status  # e.g., "UN" for unassigned
-        
-        resp = requests.get(url, headers=concur_headers(), params=params, timeout=30)
-        resp.raise_for_status()
-        payload = resp.json() or {}
-        
-        # Handle varying response shapes
-        items = (
-            payload.get("Items")
-            or payload.get("items")
-            or payload.get("Transactions")
-            or payload.get("transactions")
-            or []
-        )
-        
-        if not items:
-            break  # No more data
-        
-        # Detect if tenant ignores paging (returns same first item)
-        first_id = str(items[0].get("id") or items[0].get("transactionId") or "")
-        if page > 1 and first_id and seen_first_id == first_id:
-            break  # Infinite loop protection
-        if page == 1 and first_id:
-            seen_first_id = first_id
-        
-        all_items.extend(items)
-        
-        if len(items) < page_size:
-            break  # Last page (partial results)
-        
-        page += 1
-        if page > 100:  # Safety: max 100 pages (100 * 500 = 50k transactions)
-            break
-    
-    return all_items
+        return fallback  # Fall back to env var or None
 ```
 
 **Why This Matters**:
-- Without infinite loop protection, app could hang if tenant ignores paging
-- Handles both compliant and non-compliant Concur implementations
-- Provides safety limits to prevent runaway API calls
+- **Local Development**: Key Vault unavailable → uses env vars
+- **Production**: Key Vault available → uses secure storage
+- **Resilience**: Temporary Key Vault outage → cached values continue working
+- **Performance**: Reduces Key Vault API calls (~50-100ms each)
 
 ---
 
-### 6. Primary Endpoint: Unassigned Cards for Current User
+## API Endpoints Reference
 
-```python
-@app.post("/api/cards/unassigned/search")
-def api_cards_unassigned_search(
-    req: UnassignedCardsRequest, 
-    current_user: Dict[str, Any] = Depends(get_current_user)
-):
-    """
-    Returns unassigned card transactions for the authenticated SharePoint user.
-    
-    Flow:
-    1. Extract UPN from Azure AD token claims
-    2. Resolve UPN to Concur User ID
-    3. Fetch card transactions (with status="UN" for unassigned)
-    4. Filter out transactions with expenseId or reportId
-    5. Return JSON with summary + transaction list
-    """
-    # Step 1: Get user identity from JWT
-    upn = (
-        current_user.get("upn") 
-        or current_user.get("preferred_username") 
-        or current_user.get("email")
-    )
-    if not upn:
-        raise HTTPException(400, "Cannot determine user identity")
-    
-    # Step 2: UPN → Concur User ID
-    concur_user_id = get_concur_user_id_for_upn(upn)
-    
-    # Step 3: Fetch transactions
-    txns = get_card_transactions(
-        concur_user_id,
-        req.transactionDateFrom,
-        req.transactionDateTo,
-        status="UN",  # Unassigned filter
-        page_size=req.pageSize,
-    )
-    
-    # Step 4: Filter unassigned
-    unassigned = filter_unassigned_cards(txns)
-    
-    # Step 5: Return JSON
-    return {
-        "summary": {
-            "upn": upn,
-            "concurUserId": concur_user_id,
-            "dateFrom": req.transactionDateFrom,
-            "dateTo": req.transactionDateTo,
-            "unassignedCardCount": len(unassigned),
-        },
-        "transactions": unassigned,
-    }
+### Endpoint Map
+
+```
+GET  /build                    ← Deployment fingerprint
+GET  /kv-test                  ← Key Vault diagnostics
+GET  /auth/config-status       ← Azure AD config check
+GET  /api/whoami               ← Current user info (requires auth)
+GET  /api/concur/auth-test     ← Concur OAuth test
+GET  /api/users                ← List users (requires auth)
+GET  /api/users/{user_id}      ← User detail (requires auth)
+GET  /api/users/export         ← Excel export (requires auth)
 ```
 
-**Request Model**:
-```python
-class UnassignedCardsRequest(BaseModel):
-    transactionDateFrom: str  # YYYY-MM-DD
-    transactionDateTo: str    # YYYY-MM-DD
-    dateType: str = "TRANSACTION"  # Metadata only (not used for filtering)
-    pageSize: int = 200  # Capped to 1-500 in get_card_transactions()
+### 1. GET /api/users
+
+**Purpose**: Retrieve paginated list of Concur users for SharePoint UI grid
+
+**Authentication**: Required (Azure AD JWT)
+
+**Query Parameters**:
+- `take`: Number of users to return (default: 500, range: 1-5000)
+
+**Request Example**:
+```http
+GET /api/users?take=100 HTTP/1.1
+Host: concur-users-api.azurewebsites.net
+Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIs...
+x-request-id: 550e8400-e29b-41d4-a716-446655440000
 ```
 
 **Response Example**:
 ```json
 {
-  "summary": {
-    "upn": "john.smith@contoso.com",
-    "concurUserId": "550e8400-e29b-41d4-a716-446655440000",
-    "dateFrom": "2025-01-01",
-    "dateTo": "2025-12-31",
-    "unassignedCardCount": 3
+  "meta": {
+    "requestedBy": "john.smith@contoso.com",
+    "returned": 100,
+    "concurBaseUrl": "https://us2.api.concursolutions.com",
+    "attributeMode": "with_concur_extension"
   },
-  "transactions": [
+  "users": [
     {
-      "transactionId": "txn-123",
-      "cardProgramId": "VISA_CORPORATE",
-      "cardProgramName": "Visa Corporate Card",
-      "accountKey": "1234",
-      "lastFourDigits": "5678",
-      "transactionDate": "2025-03-15T10:30:00Z",
-      "postedDate": "2025-03-17T00:00:00Z",
-      "billingDate": null,
-      "merchantName": "Amazon Web Services",
-      "description": "AWS Cloud Services",
-      "postedAmount": 125.50,
-      "postedCurrencyCode": "USD",
-      "transactionAmount": 125.50,
-      "transactionCurrencyCode": "USD",
-      "billingAmount": null,
-      "billingCurrencyCode": null
+      "id": "550e8400-e29b-41d4-a716-446655440000",
+      "displayName": "John Smith",
+      "userName": "john.smith@contoso.com",
+      "email": "john.smith@contoso.com",
+      "active": true,
+      "employeeNumber": "EMP001"
     }
   ]
 }
 ```
 
----
+**Implementation Flow**:
+```
+1. FastAPI dependency injection calls get_current_user()
+   ├─ Validates Azure AD JWT
+   └─ Returns current_user dict
 
-### 7. Excel Export Endpoint
+2. Call list_users_tenant_safe(take=take)
+   ├─ Try: _identity_list_users_paged(ATTRS_WITH_CONCUR_EXT)
+   │   ├─ If success: return (users, "with_concur_extension")
+   │   └─ If 400 "Unrecognized attributes": catch and retry
+   └─ Retry: _identity_list_users_paged(ATTRS_NO_CONCUR_EXT)
+       └─ Return (users, "no_concur_extension")
 
-```python
-@app.post("/api/cards/unassigned/export")
-def api_cards_unassigned_export(
-    req: UnassignedCardsRequest, 
-    current_user: Dict[str, Any] = Depends(get_current_user)
-):
-    """
-    Generate Excel file with unassigned cards for current user.
-    
-    Internally calls /search endpoint, then formats as Excel.
-    """
-    # Reuse search logic
-    data = api_cards_unassigned_search(req, current_user=current_user)
-    unassigned = data["transactions"]
-    
-    # Generate Excel bytes
-    excel_bytes = export_accruals_to_excel(
-        unsubmitted_reports=[],  # Not included in user-specific export
-        unassigned_cards=unassigned,
-        card_totals_by_program=None,
-        card_totals_by_user=None,
-        meta={
-            "dateFrom": req.transactionDateFrom,
-            "dateTo": req.transactionDateTo,
-            "dateType": req.dateType
-        },
-    )
-    
-    # Stream response
-    filename = f"Concur_Unassigned_Cards_{datetime.now():%Y%m%d_%H%M}.xlsx"
-    return StreamingResponse(
-        BytesIO(excel_bytes),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-       headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+3. _identity_list_users_paged() pagination loop:
+   ├─ page = 0, startIndex = 1
+   ├─ While page < max_pages (200):
+   │   ├─ GET /profile/identity/v4.1/Users
+   │   │   ?attributes={attrs}
+   │   │   &startIndex={startIndex}
+   │   │   &count=200
+   │   ├─ Append Resources to all_users[]
+   │   ├─ startIndex += itemsPerPage
+   │   ├─ Break if: no resources, startIndex > totalResults, or len(resources) < count
+   │   └─ page++
+   └─ Return all_users
+
+4. Transform users: _to_grid_row_identity(user) for each
+   ├─ Extract enterprise extension attributes
+   ├─ Extract primary email from emails array
+   └─ Return flattened dict
+
+5. Build response with meta + users array
 ```
 
-**Excel Generation** (`services/excel_export.py`):
-```python
-def export_accruals_to_excel(
-    unsubmitted_reports: List[Dict],
-    unassigned_cards: List[Dict],
-    card_totals_by_program: Optional[List[Dict]] = None,
-    card_totals_by_user: Optional[List[Dict]] = None,
-    meta: Optional[Dict] = None
-) -> bytes:
-    """
-    Populate Excel template with data and return bytes.
-    
-    Template path resolution (handles Azure /home/site/wwwroot structure):
-    - Resolves to: <script_dir>/../reports/accrual report.xlsx
-    - Raises FileNotFoundError if template missing
-    """
-    if not os.path.exists(TEMPLATE_PATH):
-        raise FileNotFoundError(f"Template not found: {TEMPLATE_PATH}")
-    
-    wb = load_workbook(TEMPLATE_PATH)
-    
-    # Populate "unassigned card transactions" sheet
-    ws_cards = wb["unassigned card transactions"]
-    # Clear existing data (row 2 onwards)
-    _clear_data(ws_cards, start_row=2)
-    
-    for row, card in enumerate(unassigned_cards, start=2):
-        ws_cards.cell(row, 1).value = card.get("cardProgramName")
-        ws_cards.cell(row, 2).value = card.get("accountKey")
-        ws_cards.cell(row, 3).value = card.get("lastFourDigits")
-        ws_cards.cell(row, 4).value = card.get("transactionDate")
-        ws_cards.cell(row, 5).value = card.get("postedDate")
-        ws_cards.cell(row, 6).value = card.get("merchantName")
-        ws_cards.cell(row, 7).value = card.get("description")
-        ws_cards.cell(row, 8).value = card.get("postedAmount")
-        ws_cards.cell(row, 9).value = card.get("postedCurrencyCode")
-    
-    # Save to BytesIO
-    output = BytesIO()
-    wb.save(output)
-    output.seek(0)
-    return output.read()
+### 2. GET /api/users/{user_id}
+
+**Purpose**: Fetch complete SCIM profile for a single user
+
+**Authentication**: Required (Azure AD JWT)
+
+**Path Parameters**:
+- `user_id`: Concur user UUID
+
+**Request Example**:
+```http
+GET /api/users/550e8400-e29b-41d4-a716-446655440000 HTTP/1.1
+Host: concur-users-api.azurewebsites.net
+Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIs...
 ```
 
-**Template Requirements**:
-- Must exist at `reports/accrual report.xlsx` in deployment package
-- Must have sheet named `"unassigned card transactions"` with headers in row 1
-- Optionally: `"unsubnitted reports"` sheet (for legacy endpoint)
-- Optionally: `"Card totals"` sheet (created dynamically if needed)
-
----
-
-### 8. Legacy Endpoint (Organization-Wide)
-
-```python
-@app.post("/api/accruals/search")
-def api_accruals_search(req: AccrualsSearchRequest):
-    """
-    Legacy org-wide accruals export.
-    
-    WARNING: Can be slow for large organizations (sequential API calls per user).
-    Does NOT require Azure AD authentication (should be added for production).
-    
-    Returns: Excel file (not JSON like v1 implementation)
-    """
-    # Get all users matching org filter
-    users = get_users(req)
-    
-    unsubmitted_reports_all: List[Dict] = []
-    unassigned_cards_all: List[Dict] = []
-    
-    # Sequential processing (slow!)
-    for u in users:
-        user_id = u.get("id")
-        if not user_id:
-            continue
-        
-        # Fetch expense reports
-        reports = get_expense_reports(user_id)
-        unsubmitted_reports_all.extend(filter_unsubmitted_reports(reports))
-        
-        # Fetch card transactions (huge date window!)
-        txns = get_card_transactions(
-            user_id,
-            "2000-01-01",  # Historical
-            datetime.now().strftime("%Y-%m-%d")
-        )
-        unassigned_cards_all.extend(filter_unassigned_cards(txns))
-    
-    # Generate Excel
-    excel_bytes = export_accruals_to_excel(
-        unsubmitted_reports_all,
-        unassigned_cards_all
-    )
-    
-    filename = f"Concur_Accruals_{datetime.now():%Y%m%d_%H%M}.xlsx"
-    return StreamingResponse(
-        BytesIO(excel_bytes),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
-```
-
-**SCIM Filter Construction** (for org filtering):
-```python
-def build_identity_filter(req: Any) -> Optional[str]:
-    """
-    Build SCIM filter for Concur Identity API.
-    
-    URN Schema: urn:ietf:params:scim:schemas:extension:concur:2.0:User
-    (Note: Changed from 'spend' to 'concur' namespace)
-    """
-    parts = []
-    if getattr(req, "orgUnit1", None):
-        parts.append(
-            f'urn:ietf:params:scim:schemas:extension:concur:2.0:User:orgUnit1 eq "{req.orgUnit1}"'
-        )
-    # ... similar for orgUnit2-6 and custom21
-    
-    if not parts:
-        return None
-    return " and ".join(parts)
-```
-
----
-
-## CORS Configuration
-
-```python
-allowed_origin = env("SP_ORIGIN", "")  # e.g., https://contoso.sharepoint.com
-origins = [allowed_origin] if allowed_origin else ["*"]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,  # Required for Authorization header
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-```
-
-**Environment Variable**:
-- `SP_ORIGIN`: SharePoint tenant URL (e.g., `https://contoso.sharepoint.com`)
-- If not set: Allows all origins (`["*"]`) - **NOT RECOMMENDED FOR PRODUCTION**
-
----
-
-## Diagnostic Endpoints
-
-### GET /build
-```python
-@app.get("/build")
-def build():
-    return {
-        "fingerprint": BUILD_FINGERPRINT,  # SCM_COMMIT_ID or WEBSITE_DEPLOYMENT_ID
-        "run_from_package": env("WEBSITE_RUN_FROM_PACKAGE"),
-        "cwd": os.getcwd(),
-        "pythonpath0": sys.path[0],
-    }
-```
-
-### GET /kv-test
-```python
-@app.get("/kv-test")
-def kv_test():
-    st = keyvault_status()  # from services.identity_service
-    return {"status": "ok", "keyvault": st}
-```
-
-**Returns**:
+**Response Example** (SCIM v2.0 User Resource):
 ```json
 {
-  "status": "ok",
-  "keyvault": {
-    "keyvault_name_set": true,
-    "keyvault_name": "my-kv",
-    "keyvault_url": "https://my-kv.vault.azure.net/",
-    "client_initialized": true,
-    "cache_size": 4,
-    "cache_ttl_seconds": 300
+  "schemas": [
+    "urn:ietf:params:scim:schemas:core:2.0:User",
+    "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User",
+    "urn:ietf:params:scim:schemas:extension:concur:2.0:User"
+  ],
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "userName": "john.smith@contoso.com",
+  "displayName": "John Smith",
+  "active": true,
+  "emails": [
+    {
+      "value": "john.smith@contoso.com",
+      "type": "work",
+      "primary": true
+    }
+  ],
+  "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+    "employeeNumber": "EMP001",
+    "organization": "Contoso Corp",
+    "division": "Engineering",
+    "department": "Platform"
+  },
+  "urn:ietf:params:scim:schemas:extension:concur:2.0:User": {
+    "orgUnit1": "Engineering",
+    "orgUnit2": "Platform",
+    "custom21": "CC-1234",
+    "reimbursementCurrency": "USD",
+    "ledgerCode": "DEFAULT"
   }
 }
 ```
 
-### GET /auth/config-status
-```python
-@app.get("/auth/config-status")
-def auth_config_status():
-    return get_azure_ad_config_status()  # from auth.azure_ad
+**Error Handling**:
+```json
+// 400 Bad Request (missing user_id)
+{
+  "detail": {
+    "error": "missing_user_id",
+    "message": "user_id is required"
+  }
+}
+
+// 502 Bad Gateway (Concur error)
+{
+  "detail": {
+    "where": "user_detail",
+    "error": "concur_error",
+    "concur_status": 404,
+    "url": "https://us2.api.concursolutions.com/profile/identity/v4.1/Users/xxx",
+    "base_url": "https://us2.api.concursolutions.com",
+    "response": "{\"errors\":[{\"errorCode\":\"invalidId\",\"errorMessage\":\"User not found\"}]}"
+  }
+}
 ```
 
-**Returns Azure AD configuration** (tenant ID, app ID, valid audiences, etc.)
+### 3. GET /api/users/export
 
-### GET /api/concur/auth-test
-```python
-@app.get("/api/concur/auth-test")
-def api_concur_auth_test():
-    """
-    End-to-end test:
-    1. Get OAuth client
-    2. Fetch access token
-    3. Call Concur Identity API (lightweight check)
-    """
-    try:
-        return concur_auth_test()
-    except Exception as ex:
-        raise HTTPException(500, detail=str(ex))
-```
+**Purpose**: Generate Excel file with user data
 
-**Returns**:
+**Authentication**: Required (Azure AD JWT)
+
+**Query Parameters**:
+- `take`: Number of users to include (default: 1000, range: 1-5000)
+
+**Response**:
+- **Content-Type**: `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
+- **Content-Disposition**: `attachment; filename="Concur_Users_20260102_0915.xlsx"`
+
+**Excel Structure**:
+- **Sheet 1**: "unassigned card transactions" (empty)
+- **Sheet 2**: "unsubnitted reports" (empty)
+- **Sheet 3**: "Users" (if `extra_sheets` parameter supported by `export_accruals_to_excel`)
+
+### 4. GET /api/whoami
+
+**Purpose**: Debug endpoint to inspect decoded JWT claims
+
+**Authentication**: Required (Azure AD JWT)
+
+**Response**: Raw decoded JWT payload
 ```json
 {
-  "status_code": 200,
-  "ok": true,
-  "sample": [{"id": "...", "userName": "..."}]
+  "aud": "api://concur-users-api",
+  "iss": "https://sts.windows.net/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx/",
+  "iat": 1735689000,
+  "nbf": 1735689000,
+  "exp": 1735692600,
+  "upn": "john.smith@contoso.com",
+  "oid": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "name": "John Smith",
+  "scp": "access_as_user",
+  "x-request-id": "550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
 ---
 
-## Configuration
+## Data Flow Diagrams
 
-### Environment Variables
+### Complete Request Lifecycle
 
-#### Required (Azure App Service)
+```
+┌────────────────────────────────────────────────────────────┐
+│ PHASE 1: Request Initiation (SharePoint Browser)          │
+└────────────────────────────────────────────────────────────┘
 
-| Variable | Example | Description |
-|----------|---------|-------------|
-| `KEYVAULT_NAME` | `concur-secrets-kv` | Azure Key Vault name (auto-set) |
-| `AZURE_AD_TENANT_ID` | `xxx-xxx-xxx` | Azure AD tenant ID |
-| `AZURE_AD_APP_ID` | `xxx-xxx-xxx` | API app registration client ID |
-| `AZURE_AD_APP_ID_URI` | `api://concur-api` | Application ID URI |
-| `VALIDATE_AZURE_AD_TOKEN` | `true` | Enable JWT validation |
+User clicks "Load Users" button in SharePoint web part
+           │
+           ▼
+SPFx component calls API:
+  const client = await context.aadHttpClientFactory
+    .getClient('api://concur-users-api');
+  const response = await client.get(
+    'https://concur-users-api.azurewebsites.net/api/users?take=500',
+    AadHttpClient.configurations.v1
+  );
+           │
+           ├─ AadHttpClient automatically:
+           │  ├─ Gets Azure AD token for current user
+           │  ├─ Sets Authorization: Bearer <token>
+           │  └─ Sets x-request-id: <uuid>
+           │
+           ▼
+HTTP Request sent:
+  GET /api/users?take=500 HTTP/1.1
+  Host: concur-users-api.azurewebsites.net
+  Authorization: Bearer eyJ0eXAiOi...
+  x-request-id: 550e8400-e29b-41d4-a716-446655440000
+  Origin: https://contoso.sharepoint.com
 
-#### Optional
+┌────────────────────────────────────────────────────────────┐
+│ PHASE 2: Azure App Service Processing                     │
+└────────────────────────────────────────────────────────────┘
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SP_ORIGIN` | `*` | SharePoint origin for CORS |
-| `SECRET_TTL_SECONDS` | `300` | Key Vault cache TTL |
-| `CONCUR_TOKEN_URL` | (derived) | Override OAuth endpoint |
-| `CONCUR_API_BASE_URL` | (required) | Fallback if Key Vault unavailable |
+Request hits NGINX (:80)
+           │
+           ▼
+NGINX forwards to Gunicorn (:8000)
+           │
+           ▼
+Gunicorn worker picks up request
+           │
+           ▼
+Uvicorn ASGI server handles request
+           │
+           ▼
+FastAPI application receives request
+           │
+           ▼
+CORS Middleware executes:
+  ├─ Check: Origin in allowed_origins?
+  ├─ If preflight (OPTIONS): return CORS headers
+  └─ If actual request: add CORS headers to response
+           │
+           ▼
+Route matching: /api/users found
+           │
+           ▼
+Dependency resolution: Depends(get_current_user)
+           │
+           ▼
+get_current_user() executes:
+  ├─ Extract Authorization header
+  ├─ Parse bearer scheme
+  ├─ Decode JWT (no verification)
+  ├─ Extract kid from header
+  ├─ Fetch Microsoft public key (JWKS)
+  ├─ Verify RS256 signature
+  ├─ Validate exp, nbf, aud, iss
+  ├─ Extract x-request-id from header
+  └─ Return decoded payload
+           │
+           ▼
+api_users_list() function executes:
+  ├─ Parameter: take=500
+  ├─ Parameter: current_user={...decoded JWT...}
+  └─ Calls list_users_tenant_safe(500)
 
-### Azure Key Vault Secrets
+┌────────────────────────────────────────────────────────────┐
+│ PHASE 3: Concur API Integration                           │
+└────────────────────────────────────────────────────────────┘
 
-| Secret Name | Example Value |
-|-------------|---------------|
-| `concur-api-base-url` | `https://us2.api.concursolutions.com` |
-| `concur-token-url` | `https://us2.api.concursolutions.com/oauth2/v0/token` |
-| `concur-client-id` | `abc123...` |
-| `concur-client-secret` | `secret456...` |
-| `concur-refresh-token` | `refresh789...` |
+list_users_tenant_safe(500) executes:
+           │
+           ▼
+Try with Concur extension attributes:
+  _identity_list_users_paged(
+    attributes=ATTRS_WITH_CONCUR_EXT,
+    count=200,
+    max_pages=200
+  )
+           │
+           ├─ If HTTPException with 400 "Unrecognized attributes":
+           │  └─ Retry with ATTRS_NO_CONCUR_EXT
+           │
+           ▼
+_identity_list_users_paged() pagination loop:
+           │
+           ▼
+Initialize: page=0, startIndex=1, all_users=[]
+           │
+           ▼
+While page < 200:
+  ├─ Build params:
+  │  {
+  │    "attributes": "id,userName,displayName,...",
+  │    "startIndex": startIndex,
+  │    "count": 200
+  │  }
+  │
+  ├─ Call concur_headers():
+  │  ├─ Call get_oauth_client() (lazy singleton init)
+  │  │  ├─ If _oauth_client exists: return cached
+  │  │  └─ If not exists:
+  │  │     ├─ Load credentials from Key Vault:
+  │  │     │  ├─ kv("concur-token-url")
+  │  │     │  │  ├─ Try: get_secret("concur-token-url")
+  │  │     │  │  │  ├─ Check cache: now - ts < 300?
+  │  │     │  │  │  │  ├─ If yes: return cached value
+  │  │     │  │  │  │  └─ If no: fetch from Key Vault
+  │  │     │  │  │  │     ├─ DefaultAzureCredential auth
+  │  │     │  │  │  │     ├─ SecretClient.get_secret()
+  │  │     │  │  │  │     ├─ Update cache: {value, ts}
+  │  │     │  │  │  │     └─ Return value
+  │  │     │  │  └─ Catch: return env("CONCUR_TOKEN_URL")
+  │  │     │  ├─ kv("concur-client-id")
+  │  │     │  ├─ kv("concur-client-secret")
+  │  │     │  └─ kv("concur-refresh-token")
+  │  │     ├─ Validate all present
+  │  │     ├─ Instantiate: ConcurOAuthClient(...)
+  │  │     └─ Store in _oauth_client
+  │  │
+  │  ├─ Call oauth.get_access_token():
+  │  │  ├─ Check: now < expires_at - 60?
+  │  │  │  ├─ If yes: return cached access_token
+  │  │  │  └─ If no: refresh
+  │  │  ├─ Refresh flow:
+  │  │  │  ├─ POST to token_url
+  │  │  │  │  Body: {
+  │  │  │  │    grant_type: "refresh_token",
+  │  │  │  │    refresh_token: current_refresh_token,
+  │  │  │  │    client_id: client_id,
+  │  │  │  │    client_secret: client_secret
+  │  │  │  │  }
+  │  │  │  ├─ Response: {access_token, expires_in, refresh_token?}
+  │  │  │  ├─ Update: _access_token = access_token
+  │  │  │  ├─ Update: _expires_at = now + expires_in
+  │  │  │  └─ If new refresh_token: update refresh_token
+  │  │  └─ Return access_token
+  │  │
+  │  └─ Return: {"Authorization": "Bearer <token>", "Accept": "application/json"}
+  │
+  ├─ Make request:
+  │  GET https://us2.api.concursolutions.com/profile/identity/v4.1/Users
+  │    ?attributes=id,userName,...
+  │    &startIndex=1
+  │    &count=200
+  │  Headers: {Authorization: Bearer <concur-token>, Accept: application/json}
+  │
+  ├─ Handle response:
+  │  ├─ If network error: raise HTTPException 502 with details
+  │  ├─ If not resp.ok: raise HTTPException 502 with Concur error
+  │  └─ If ok: parse JSON
+  │
+  ├─ Extract payload.Resources
+  │  ├─ If empty or not list: break
+  │  └─ Append to all_users
+  │
+  ├─ Update pagination:
+  │  ├─ totalResults = payload.totalResults
+  │  ├─ itemsPerPage = payload.itemsPerPage || len(resources)
+  │  ├─ startIndex += itemsPerPage
+  │  └─ page++
+  │
+  ├─ Break conditions:
+  │  ├─ startIndex > totalResults
+  │  ├─ len(resources) < count
+  │  └─ page >= max_pages
+  │
+  └─ Loop continues...
+
+Return all_users (up to max_pages * count)
+
+┌────────────────────────────────────────────────────────────┐
+│ PHASE 4: Response Formatting                              │
+└────────────────────────────────────────────────────────────┘
+
+list_users_tenant_safe() returns:
+  (users, "with_concur_extension")  or
+  (users, "no_concur_extension")
+           │
+           ▼
+Slice users[:take] → users[:500]
+           │
+           ▼
+Transform each user:
+  _to_grid_row_identity(user)
+  ├─ Extract enterprise extension
+  ├─ Extract primary email from emails array
+  └─ Return: {
+       id, displayName, userName,
+       email, active, employeeNumber
+     }
+           │
+           ▼
+Build response dict:
+  {
+    "meta": {
+      "requestedBy": current_user.upn,
+      "returned": len(users),
+      "concurBaseUrl": concur_base_url(),
+      "attributeMode": mode
+    },
+    "users": [transformed_users]
+  }
+           │
+           ▼
+FastAPI serializes to JSON
+           │
+           ▼
+CORS headers added
+           │
+           ▼
+Uvicorn sends HTTP response
+           │
+           ▼
+Gunicorn forwards to NGINX
+           │
+           ▼
+NGINX sends to client
+
+┌────────────────────────────────────────────────────────────┐
+│ PHASE 5: SharePoint UI Update                             │
+└────────────────────────────────────────────────────────────┘
+
+Browser receives response:
+  HTTP/1.1 200 OK
+  Content-Type: application/json
+  Access-Control-Allow-Origin: https://contoso.sharepoint.com
+  
+  {
+    "meta": {...},
+    "users": [...]
+  }
+           │
+           ▼
+SPFx web part parses JSON
+           │
+           ▼
+Updates React state:
+  setState({
+    users: response.users,
+    loading: false,
+    metadata: response.meta
+  })
+           │
+           ▼
+React re-renders DetailsList component
+           │
+           ▼
+User sees grid populated with users
+```
 
 ---
 
-## Deployment
+## Concur Identity API Integration
 
-### Azure App Service
+### SCIM 2.0 Protocol
+
+The Concur Identity v4.1 API implements **SCIM 2.0** (System for Cross-domain Identity Management).
+
+**Key Characteristics**:
+- **RESTful**: Standard HTTP verbs (GET, POST, PATCH, DELETE)
+- **JSON**: Request/response bodies
+- **Pagination**: startIndex/count (1-indexed)
+- **Filtering**: SCIM filter expressions (not used in current implementation)
+- **Attributes**: Selective field retrieval via `?attributes=` parameter
+
+### Pagination Strategy
+
+```python
+# Current implementation: Simple pagination without filter
+GET /profile/identity/v4.1/Users
+  ?attributes=id,userName,displayName,active,emails.value,
+               urn:ietf:params:scim:schemas:extension:enterprise:2.0:User,
+               urn:ietf:params:scim:schemas:extension:concur:2.0:User
+  &startIndex=1
+  &count=200
+
+# Response structure
+{
+  "totalResults": 5432,        // Total users in system
+  "itemsPerPage": 200,         // Users in this response
+  "startIndex": 1,             // Current page start
+  "Resources": [               // Array of User objects
+    {
+      "id": "...",
+      "userName": "...",
+      ...
+    }
+  ]
+}
+```
+
+**Pagination Loop Logic**:
+```python
+startIndex = 1
+page = 0
+all_users = []
+
+while page < max_pages:
+    params = {"startIndex": startIndex, "count": 200}
+    response = GET /Users with params
+    
+    resources = response["Resources"]
+    if not resources:
+        break  # No more data
+    
+    all_users.extend(resources)
+    
+    itemsPerPage = response["itemsPerPage"] or len(resources)
+    startIndex += itemsPerPage
+    page += 1
+    
+    # Stop conditions
+    if startIndex > response["totalResults"]:
+        break
+    if len(resources) < count:
+        break  # Last page (partial)
+
+return all_users
+```
+
+### Tenant-Safe Attribute Handling
+
+**Problem**: Some Concur tenants don't support the Concur extension schema, resulting in 400 errors.
+
+**Solution**: Try-catch with fallback
+
+```python
+# Attempt 1: With Concur extension
+ATTRS_WITH_CONCUR_EXT = (
+    "id,userName,displayName,active,emails.value,"
+    "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User,"
+    "urn:ietf:params:scim:schemas:extension:concur:2.0:User"
+)
+
+try:
+    users = _identity_list_users_paged(attributes=ATTRS_WITH_CONCUR_EXT)
+    return (users, "with_concur_extension")
+except HTTPException as he:
+    if is_unrecognized_attributes_error(he):
+        # Attempt 2: Without Concur extension
+        ATTRS_NO_CONCUR_EXT = (
+            "id,userName,displayName,active,emails.value,"
+            "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"
+        )
+        users = _identity_list_users_paged(attributes=ATTRS_NO_CONCUR_EXT)
+        return (users, "no_concur_extension")
+    raise  # Other errors propagate
+```
+
+**Why This Matters**:
+- **Compatibility**: Works with all Concur tenant configurations
+- **Graceful Degradation**: Returns what's available
+- **Transparency**: `attributeMode` in response tells client what was returned
+
+---
+
+## Error Handling Strategy
+
+### Error Enrichment Philosophy
+
+All errors include **contextual metadata** to aid debugging:
+
+```python
+raise HTTPException(
+    status_code=502,
+    detail={
+        "where": "identity_list_users_paged",     # Function name
+        "error": "concur_error",                   # Error category
+        "concur_status": resp.status_code,         # Concur HTTP status
+        "url": url,                                # Request URL
+        "params": params,                          # Query parameters
+        "base_url": base,                          # Concur base URL
+        "response": (resp.text or "")[:2000],      # Truncated response
+    }
+)
+```
+
+### Error Categories
+
+| HTTP Status | Category | Meaning |
+|-------------|----------|---------|
+| 400 | Client Error | Invalid request from SharePoint |
+| 401 | Unauthorized | Azure AD JWT invalid/missing |
+| 403 | Forbidden | Valid JWT but insufficient permissions |
+| 404 | Not Found | User ID doesn't exist in Concur |
+| 500 | Server Error | Application bug or misconfiguration |
+| 502 | Bad Gateway | Concur API error or timeout |
+
+### Example Error Responses
+
+**401 - Missing/Invalid JWT**:
+```json
+{
+  "detail": {
+    "error": "missing_token",
+    "message": "No Authorization header found"
+  }
+}
+```
+
+**502 - Concur API Error**:
+```json
+{
+  "detail": {
+    "where": "identity_list_users_paged",
+    "error": "concur_error",
+    "concur_status": 401,
+    "url": "https://us2.api.concursolutions.com/profile/identity/v4.1/Users",
+    "params": {"attributes": "...", "startIndex": 1, "count": 200},
+    "base_url": "https://us2.api.concursolutions.com",
+    "response": "{\"error\":\"unauthorized\",\"error_description\":\"Invalid access token\"}"
+  }
+}
+```
+
+---
+
+## Configuration Management
+
+### Configuration Hierarchy
+
+```
+1. Azure Key Vault (Production)
+   └─ authenticate: Managed Identity
+   └─ cache: 5 minutes
+   └─ secrets: concur-*
+
+2. Environment Variables (Fallback/Local Dev)
+   └─ set: Azure App Service → Configuration → Application Settings
+   └─ examples: CONCUR_TOKEN_URL, CONCUR_CLIENT_ID
+
+3. Hardcoded Defaults (Last Resort)
+   └─ concur_base_url() → "https://www.concursolutions.com"
+```
+
+### Required Configuration
+
+| Variable | Source Priority | Example | Required |
+|----------|----------------|---------|----------|
+| `KEYVAULT_NAME` | Env only | `concur-kv` | Production |
+| `AZURE_AD_TENANT_ID` | Env only | `xxx-xxx-xxx-xxx` | Yes |
+| `AZURE_AD_APP_ID` | Env only | `xxx-xxx-xxx-xxx` | Yes |
+| `AZURE_AD_APP_ID_URI` | Env only | `api://concur-users-api` | Yes |
+| `VALIDATE_AZURE_AD_TOKEN` | Env only | `true` | Yes (prod) |
+| `SP_ORIGIN` | Env only | `https://contoso.sharepoint.com` | Recommended |
+| `concur-token-url` | KV → Env | `https://us2.api.concursolutions.com/oauth2/v0/token` | Yes |
+| `concur-client-id` | KV → Env | `abc123...` | Yes |
+| `concur-client-secret` | KV → Env | `secret456...` | Yes |
+| `concur-refresh-token` | KV → Env | `refresh789...` | Yes |
+| `concur-api-base-url` | KV → Env → Default | `https://us2.api.concursolutions.com` | No |
+
+---
+
+## Deployment Guide
+
+### Azure App Service Setup
 
 ```bash
-# 1. Create deployment package
-zip -r deploy.zip . -x "*.git*" -x "venv/*" -x "__pycache__/*"
+# Variables
+RG="concur-users-rg"
+APP_NAME="concur-users-api"
+LOCATION="australiaeast"
+KV_NAME="concur-kv"
+SP_ORIGIN="https://contoso.sharepoint.com"
 
-# 2. Deploy
-az webapp deployment source config-zip \
+# 1. Create Resource Group
+az group create --name $RG --location $LOCATION
+
+# 2. Create Key Vault
+az keyvault create \
+  --name $KV_NAME \
   --resource-group $RG \
+  --location $LOCATION \
+  --sku standard
+
+# 3. Add secrets to Key Vault
+az keyvault secret set --vault-name $KV_NAME --name concur-token-url --value "https://us2.api.concursolutions.com/oauth2/v0/token"
+az keyvault secret set --vault-name $KV_NAME --name concur-client-id --value "your-client-id"
+az keyvault secret set --vault-name $KV_NAME --name concur-client-secret --value "your-client-secret"
+az keyvault secret set --vault-name $KV_NAME --name concur-refresh-token --value "your-refresh-token"
+az keyvault secret set --vault-name $KV_NAME --name concur-api-base-url --value "https://us2.api.concursolutions.com"
+
+# 4. Create App Service Plan (Linux)
+az appservice plan create \
+  --name "${APP_NAME}-plan" \
+  --resource-group $RG \
+  --location $LOCATION \
+  --sku B1 \
+  --is-linux
+
+# 5. Create Web App
+az webapp create \
   --name $APP_NAME \
+  --resource-group $RG \
+  --plan "${APP_NAME}-plan" \
+  --runtime "PYTHON:3.11"
+
+# 6. Enable Managed Identity
+az webapp identity assign \
+  --name $APP_NAME \
+  --resource-group $RG
+
+# Get principal ID
+PRINCIPAL_ID=$(az webapp identity show \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --query principalId -o tsv)
+
+# 7. Grant Key Vault access to Managed Identity
+az keyvault set-policy \
+  --name $KV_NAME \
+  --object-id $PRINCIPAL_ID \
+  --secret-permissions get list
+
+# 8. Configure App Settings
+az webapp config appsettings set \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --settings \
+    KEYVAULT_NAME=$KV_NAME \
+    AZURE_AD_TENANT_ID="<your-tenant-id>" \
+    AZURE_AD_APP_ID="<api-app-id>" \
+    AZURE_AD_APP_ID_URI="api://concur-users-api" \
+    VALIDATE_AZURE_AD_TOKEN="true" \
+    SP_ORIGIN=$SP_ORIGIN \
+    SCM_DO_BUILD_DURING_DEPLOYMENT="true" \
+    WEBSITE_RUN_FROM_PACKAGE="1"
+
+# 9. Configure startup command
+az webapp config set \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --startup-file "gunicorn main:app --workers 4 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --timeout 120"
+
+# 10. Deploy code
+zip -r deploy.zip . -x "*.git*" -x "venv/*" -x "__pycache__/*" -x ".venv/*"
+
+az webapp deployment source config-zip \
+  --name $APP_NAME \
+  --resource-group $RG \
   --src deploy.zip
 
-# 3. Configure startup command
-# App Service → Configuration → General Settings:
-gunicorn main:app \
-  --workers 4 \
-  --worker-class uvicorn.workers.UvicornWorker \
-  --bind 0.0.0.0:8000 \
-  --timeout 120
+# 11. Verify deployment
+az webapp browse --name $APP_NAME --resource-group $RG
 ```
 
-### Managed Identity
+### Azure AD App Registration
 
 ```bash
-# Enable
-az webapp identity assign --name $APP_NAME --resource-group $RG
+# 1. Create app registration for API
+az ad app create \
+  --display-name "Concur Users API" \
+  --identifier-uris "api://concur-users-api" \
+  --sign-in-audience "AzureADMyOrg"
 
-# Grant Key Vault access
-PRINCIPAL_ID=$(az webapp identity show --name $APP_NAME --resource-group $RG --query principalId -o tsv)
-az keyvault set-policy --name $KV_NAME --object-id $PRINCIPAL_ID --secret-permissions get list
+APP_ID=$(az ad app list --display-name "Concur Users API" --query "[0].appId" -o tsv)
+echo "API Application ID: $APP_ID"
+
+# 2. Expose API (add scope)
+# Note: Must be done in Azure Portal
+# App Registration → Expose an API → Add a scope
+# Scope name: access_as_user
+# Consent: Admins and users
+# Description: Access Concur Users API
+
+# 3. Note values for App Service configuration:
+echo "Set these in App Service:"
+echo "  AZURE_AD_TENANT_ID: $(az account show --query tenantId -o tsv)"
+echo "  AZURE_AD_APP_ID: $APP_ID"
+echo "  AZURE_AD_APP_ID_URI: api://concur-users-api"
 ```
-
----
-
-## Performance Considerations
-
-### Bottlenecks
-
-1. **Sequential Concur API calls** (legacy endpoint)
-   - 50 users × 2 API calls × 500ms = 50 seconds
-   - Solution: Implement async/await (future)
-
-2. **Large date ranges** (legacy endpoint)
-   - Fetching from "2000-01-01" to today can return 10k+ transactions
-   - Solution: Limit date range or add pagination limits
-
-3. **Key Vault latency** (first call)
-   - ~50-100ms per secret
-   - Mitigated by 5-minute cache
-
-### Caching
-
-- **Key Vault secrets**: 5min in-memory (per worker)
-- **Concur access tokens**: 30min with 60s buffer
-- **Azure AD signing keys**: LRU cache (16 keys)
-
----
-
-## Security
-
-### Authentication Layers
-1. HTTPS (Azure App Service enforced)
-2. CORS (SharePoint origin whitelist)
-3. Azure AD JWT (signature + claims validation)
-4. Concur OAuth (refresh token → access token)
-5. Managed Identity (Key Vault access)
-
-### What's NOT Authenticated
-- **`/api/accruals/search`**: Legacy endpoint has NO auth check
-  - Should add `current_user: Dict = Depends(get_current_user)` parameter
-  - Currently open to anyone with network access
 
 ---
 
 ## Troubleshooting
 
-### 404: Concur user not found
-- **Cause**: UPN from Azure AD doesn't match Concur userName or emails.value
-- **Fix**: Verify UPN mapping or implement custom resolution logic
+### Diagnostic Endpoints
 
-### Pagination returns duplicate transactions
-- **Cause**: Tenant ignores `page` parameter
-- **Mitigation**: Defensive pagination detects this and stops
+**Check deployment**:
+```bash
+curl https://concur-users-api.azurewebsites.net/build
+```
 
-### Excel template not found
-- **Cause**: `reports/accrual report.xlsx` not in deployment package
-- **Fix**: Ensure file included in zip and path relative to main.py
+**Check Key Vault**:
+```bash
+curl https://concur-users-api.azurewebsites.net/kv-test
+```
 
-### Slow responses (legacy endpoint)
-- **Cause**: Sequential API calls for many users
-- **Fix**: Limit org scope or implement async
+**Check Azure AD config**:
+```bash
+curl https://concur-users-api.azurewebsites.net/auth/config-status
+```
+
+**Check Concur auth**:
+```bash
+curl https://concur-users-api.azurewebsites.net/api/concur/auth-test
+```
+
+### Common Issues
+
+**401 - Invalid JWT**:
+- Check `AZURE_AD_TENANT_ID` matches your Azure AD tenant
+- Check `AZURE_AD_APP_ID` matches API app registration
+- Verify SharePoint web part requests token for correct API
+
+**502 - Concur OAuth Failed**:
+- Check Key Vault secrets are set correctly
+- Verify Concur refresh token hasn't expired
+- Test with `/api/concur/auth-test` endpoint
+
+**502 - Concur 400 "Unrecognized attributes"**:
+- Normal if tenant doesn't support Concur extension
+- Should auto-fallback to `ATTRS_NO_CONCUR_EXT`
+- Check `attributeMode` in response
+
+**Empty users array**:
+- Check Concur tenant has users
+- Verify OAuth token has correct scopes
+- Check pagination parameters
 
 ---
 
-## Version History
+## Performance Characteristics
 
-- **v3.0** (2026-01-01): User-centric design, defensive pagination, Excel template path fix
-- **v2.0** (2025-01-01): Azure AD integration, CORS, refactored services
-- **v1.0** (2024-12-29): Initial production release
+### Latency Breakdown
 
-**Last Updated**: 2026-01-01  
-**Maintained By**: [Your Team]
+**Cold Start** (first request after deployment):
+```
+Total latency: ~3-5 seconds
+├─ Key Vault secret fetch: 4 secrets × 100ms = 400ms
+├─ Concur OAuth token: ~200ms
+├─ Concur Identity API: ~1-2 seconds (depends on user count)
+└─ Azure AD JWT validation: ~50ms (JWKS fetch)
+```
+
+**Warm Request** (subsequent requests):
+```
+Total latency: ~1-2 seconds
+├─ Key Vault: 0ms (cached)
+├─ Concur OAuth: 0ms (token cached, not expired)
+├─ Azure AD JWT: ~10ms (JWKS cached)
+└─ Concur Identity API: ~1-2 seconds (network + processing)
+```
+
+### Caching Strategy
+
+| Item | TTL | Storage | Hit Rate (est.) |
+|------|-----|---------|----------------|
+| Key Vault secrets | 5 min | In-memory (per worker) | 99% |
+| Concur access token | 30 min | In-memory (per worker) | 95% |
+| Azure AD JWKS keys | LRU cache | In-memory (@lru_cache) | 99% |
+
+### Scalability
+
+**Current Limitations**:
+- Sequential pagination (not parallelized)
+- Single-tenant design (one Concur instance)
+- Synchronous HTTP calls
+
+**Estimated Throughput**:
+- **50 users**: ~1-2 seconds
+- **500 users**: ~2-5 seconds (3 pages @ 200 users/page)
+- **5000 users**: ~20-30 seconds (25 pages)
+
+**Future Optimizations**:
+- Async/await with `httpx`
+- Redis caching for cross-worker shared state
+- GraphQL-style field selection
+- WebSocket support for real-time updates
+
+---
+
+**Version**: 4.0  
+**Author**: Engineering Team  
+**Last Updated**: 2026-01-02
