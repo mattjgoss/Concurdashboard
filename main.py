@@ -240,9 +240,6 @@ class UnassignedCardsRequest(BaseModel):
 # IDENTITY HELPERS (tenant-safe attributes fallback)
 # ======================================================
 
-# "Wide" identity attributes we *try* to request.
-# IMPORTANT: different Concur tenants reject different attributes. We auto-remove any
-# "Unrecognized attributes: X" and retry.
 ATTRS_WITH_CONCUR_EXT = (
     "id,userName,displayName,active,"
     "name,emails,phoneNumbers,addresses,timezone,locale,preferredLanguage,groups,meta,"
@@ -282,10 +279,6 @@ def _to_grid_row_identity(u: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _extract_unrecognized_attribute(resp: requests.Response) -> Optional[str]:
-    """
-    If Concur returns detail: "Unrecognized attributes: groups", return "groups".
-    Works for any single attribute name Concur reports.
-    """
     try:
         j = resp.json() or {}
         detail = str(j.get("detail") or "")
@@ -307,9 +300,6 @@ def _remove_attribute_from_list(attr_string: str, attr_to_remove: str) -> str:
 
 
 def _identity_list_users_paged(*, attributes: str, count: int = 200, max_pages: int = 200) -> List[Dict[str, Any]]:
-    """
-    Lists Identity v4.1 Users with paging.
-    """
     base = concur_base_url()
     url = f"{base}/profile/identity/v4.1/Users"
 
@@ -372,11 +362,6 @@ def _identity_list_users_paged(*, attributes: str, count: int = 200, max_pages: 
 
 
 def list_users_tenant_safe(take: int) -> Tuple[List[Dict[str, Any]], str]:
-    """
-    Try with Concur extension attributes first. If tenant rejects them (400 BAD_QUERY),
-    fall back to a safe attribute set.
-    Returns: (users, attribute_mode)
-    """
     try:
         users = _identity_list_users_paged(attributes=ATTRS_WITH_CONCUR_EXT, count=200, max_pages=200)
         return users[:take], "with_concur_extension"
@@ -389,10 +374,6 @@ def list_users_tenant_safe(take: int) -> Tuple[List[Dict[str, Any]], str]:
 
 
 def get_user_detail_identity(user_id: str) -> Dict[str, Any]:
-    """
-    Fetch SCIM record for a userId from Identity v4.1.
-    Robust against tenant-specific 'Unrecognized attributes: X' errors (e.g., groups).
-    """
     base = concur_base_url()
     url = f"{base}/profile/identity/v4.1/Users/{user_id}"
 
@@ -412,7 +393,6 @@ def get_user_detail_identity(user_id: str) -> Dict[str, Any]:
                     attrs = attrs2
                     continue
 
-                # Some tenants reject the Concur extension URN entirely
                 if "Unrecognized attributes" in (resp.text or "") and "urn:ietf:params:scim:schemas:extension:concur:2.0:User" in attrs:
                     attrs = ATTRS_NO_CONCUR_EXT
                     continue
@@ -447,28 +427,18 @@ def get_user_detail_identity(user_id: str) -> Dict[str, Any]:
 # ======================================================
 
 def get_user_detail_spend(user_id: str) -> Dict[str, Any]:
-    """
-    Spend user profile (includes customData[] where ids include:
-    custom1..custom22 and orgUnit1..orgUnit6, plus spend extensions).
-    """
     base = concur_base_url()
     url = f"{base}/profile/spend/v4.1/Users/{user_id}"
     return _concur_get_json(url, where="user_detail_spend")
 
 
 def get_user_detail_travel(user_id: str) -> Dict[str, Any]:
-    """
-    Travel user extension (ruleClass, orgUnit, customFields, groups, etc.).
-    """
     base = concur_base_url()
     url = f"{base}/profile/travel/v4/Users/{user_id}"
     return _concur_get_json(url, where="user_detail_travel")
 
 
 def _deep_merge(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Deep merge dictionaries (src into dst). Lists are replaced, not merged.
-    """
     for k, v in (src or {}).items():
         if isinstance(v, dict) and isinstance(dst.get(k), dict):
             _deep_merge(dst[k], v)
@@ -478,15 +448,6 @@ def _deep_merge(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _materialise_custom_fields_from_spend(spend_payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Convenience: turn Spend customData[] into derived dicts so UI doesn't need to scan arrays.
-
-    Returns:
-      {
-        "custom": {"custom1": "...", ..., "custom22": "..."},
-        "orgUnits": {"orgUnit1": "...", ..., "orgUnit6": "..."}
-      }
-    """
     out: Dict[str, Any] = {"custom": {}, "orgUnits": {}}
     if not isinstance(spend_payload, dict):
         for i in range(1, 23):
@@ -524,28 +485,16 @@ def _materialise_custom_fields_from_spend(spend_payload: Optional[Dict[str, Any]
 
 
 def _parse_expand(expand: Optional[str]) -> List[str]:
-    """
-    expand can be:
-      - None
-      - "listItems"
-      - "listItems,otherThing"
-    """
     if not expand:
         return []
-    parts = [p.strip() for p in expand.split(",") if p.strip()]
-    return parts
+    return [p.strip() for p in expand.split(",") if p.strip()]
 
 
 def _collect_list_item_refs_from_spend(spend_payload: Optional[Dict[str, Any]]) -> List[Dict[str, str]]:
-    """
-    Returns a list of refs like:
-      {"key": "<syncGuid or href>", "href": "<url>", "syncGuid": "<guid or ''>", "fieldId": "<custom/org id>"}
-    """
     refs: List[Dict[str, str]] = []
     if not isinstance(spend_payload, dict):
         return refs
 
-    # Locate customData
     custom_data = spend_payload.get("customData")
     if not isinstance(custom_data, list):
         for v in spend_payload.values():
@@ -569,7 +518,6 @@ def _collect_list_item_refs_from_spend(spend_payload: Optional[Dict[str, Any]]) 
         key = sync_guid or href
         refs.append({"key": key, "href": href, "syncGuid": sync_guid, "fieldId": field_id})
 
-    # de-dupe by key
     seen = set()
     out: List[Dict[str, str]] = []
     for r in refs:
@@ -581,10 +529,6 @@ def _collect_list_item_refs_from_spend(spend_payload: Optional[Dict[str, Any]]) 
 
 
 def _fetch_list_item_by_href(href: str) -> Dict[str, Any]:
-    """
-    Fetches a Concur List v4 item via its full href URL.
-    Uses the same Concur service token (refresh flow).
-    """
     try:
         resp = requests.get(href, headers=concur_headers(), timeout=30)
     except Exception as ex:
@@ -609,10 +553,6 @@ def _fetch_list_item_by_href(href: str) -> Dict[str, Any]:
 
 
 def expand_list_items_from_spend(spend_payload: Optional[Dict[str, Any]], *, limit: int = 50) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """
-    Expands Spend customData hrefs into actual List item payloads.
-    Returns: (items_by_key, errors_by_key)
-    """
     items: Dict[str, Any] = {}
     errors: Dict[str, Any] = {}
 
@@ -627,14 +567,74 @@ def expand_list_items_from_spend(spend_payload: Optional[Dict[str, Any]], *, lim
         href = r["href"]
         try:
             payload = _fetch_list_item_by_href(href)
-            items[key] = {
-                "ref": r,
-                "item": payload,
-            }
+            items[key] = {"ref": r, "item": payload}
         except HTTPException as he:
             errors[key] = {"ref": r, "error": he.detail}
 
     return items, errors
+
+
+def _summarise_list_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Produces a stable, UI-friendly summary for a List item payload.
+    """
+    if not isinstance(item, dict):
+        return {}
+
+    lists = item.get("lists") or []
+    list_id = None
+    if isinstance(lists, list) and lists:
+        first = lists[0] if isinstance(lists[0], dict) else None
+        if first:
+            list_id = first.get("id")
+
+    return {
+        "id": item.get("id"),
+        "code": item.get("code"),
+        "shortCode": item.get("shortCode"),
+        "value": item.get("value"),
+        "parentId": item.get("parentId"),
+        "level": item.get("level"),
+        "hasChildren": item.get("hasChildren"),
+        "isDeleted": item.get("isDeleted"),
+        "listId": list_id,
+    }
+
+
+def build_resolved_from_expanded_list_items(items_by_key: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Turn expanded list item payloads into:
+      resolved.orgUnits.orgUnitX = summary
+      resolved.custom.customX = summary
+    keyed by the Spend customData fieldId (orgUnit1..6, custom1..22).
+    """
+    resolved = {"orgUnits": {}, "custom": {}}
+    if not isinstance(items_by_key, dict):
+        return resolved
+
+    for _key, blob in items_by_key.items():
+        if not isinstance(blob, dict):
+            continue
+        ref = blob.get("ref") if isinstance(blob.get("ref"), dict) else {}
+        field_id = str(ref.get("fieldId") or "").strip()
+
+        item = blob.get("item") if isinstance(blob.get("item"), dict) else {}
+        summary = _summarise_list_item(item)
+        if not summary:
+            continue
+
+        if field_id.startswith("orgUnit"):
+            resolved["orgUnits"][field_id] = summary
+        elif field_id.startswith("custom"):
+            resolved["custom"][field_id] = summary
+
+    # ensure key presence
+    for i in range(1, 7):
+        resolved["orgUnits"].setdefault(f"orgUnit{i}", None)
+    for i in range(1, 23):
+        resolved["custom"].setdefault(f"custom{i}", None)
+
+    return resolved
 
 
 # ======================================================
@@ -683,15 +683,6 @@ def api_user_detail_full(
     expandLimit: int = Query(50, ge=0, le=200, description="Max list items to expand (safety cap)"),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """
-    Returns the maximum available employee profile data by aggregating:
-      - Identity v4.1 user (core + enterprise + optional concur ext; auto-removes invalid attrs)
-      - Spend v4.1 user (includes customData: custom1..custom22, orgUnit1..orgUnit6, plus spend extensions)
-      - Travel v4 user (travel extension data)
-
-    Optional:
-      - expand=listItems: expands customData hrefs to List v4 item payloads
-    """
     if not user_id or user_id.strip() == "":
         raise HTTPException(status_code=400, detail={"error": "missing_user_id", "message": "user_id is required"})
 
@@ -702,26 +693,22 @@ def api_user_detail_full(
         or current_user.get("email")
     )
 
-    # Identity is the anchor (must succeed)
     identity = get_user_detail_identity(user_id)
 
     partial_failures: Dict[str, Any] = {}
 
-    # Spend (optional)
     try:
         spend = get_user_detail_spend(user_id)
     except HTTPException as he:
         spend = None
         partial_failures["spend"] = he.detail
 
-    # Travel (optional)
     try:
         travel = get_user_detail_travel(user_id)
     except HTTPException as he:
         travel = None
         partial_failures["travel"] = he.detail
 
-    # Merge into a single combined payload for easy UI rendering.
     combined: Dict[str, Any] = {}
     if isinstance(identity, dict):
         _deep_merge(combined, identity)
@@ -730,7 +717,6 @@ def api_user_detail_full(
     if isinstance(travel, dict):
         _deep_merge(combined, travel)
 
-    # Add per-service meta (avoid overwrite) and derived convenience fields.
     combined["_metaByService"] = {
         "identity": identity.get("meta") if isinstance(identity, dict) else None,
         "spend": spend.get("meta") if isinstance(spend, dict) else None,
@@ -752,10 +738,16 @@ def api_user_detail_full(
                 "errors": len(errors),
                 "limit": expandLimit,
             }
+
+            # NEW: resolved (fieldId -> list item summary)
+            resolved = build_resolved_from_expanded_list_items(items)
+            combined["_derived"]["resolved"] = resolved
+
         else:
             expanded["listItems"] = {}
             expanded["listItemsErrors"] = {}
             expanded["listItemsMeta"] = {"requested": 0, "expanded": 0, "errors": 0, "limit": expandLimit}
+            combined["_derived"]["resolved"] = {"orgUnits": {}, "custom": {}}
 
     return {
         "meta": {
