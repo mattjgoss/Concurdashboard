@@ -142,17 +142,17 @@ def _concur_get_json(
 # CORS
 # ======================================================
 
-allowed_origin = env("SP_ORIGIN", "")
+allowed_origin = env("SP_ORIGIN", "https://covantagenew.sharepoint.com")
 origins = [allowed_origin] if allowed_origin else ["*"]
 
 app = FastAPI(title="SAP Concur Employee Profile Viewer API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[allowed_origin],
+    allow_credentials=False,  # bearer token auth doesn't need cookies
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
 )
 
 # ======================================================
